@@ -271,6 +271,45 @@ function ToolIcon({ tool }: { tool: Exclude<Tool, 'none'> }) {
   }
 }
 
+const ribbonIconSvgProps = {
+  className: 'ribbon-icon-svg',
+  viewBox: '0 0 24 24',
+  width: 18,
+  height: 18,
+  fill: 'none',
+  stroke: 'currentColor',
+  strokeWidth: 2,
+  strokeLinecap: 'round' as const,
+  strokeLinejoin: 'round' as const,
+  'aria-hidden': true as const,
+}
+
+/** Maximize-style corners — “show more” */
+function RibbonExpandIcon() {
+  return (
+    <svg {...ribbonIconSvgProps}>
+      <path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7" />
+    </svg>
+  )
+}
+
+/** Minimize-style corners — “show less” */
+function RibbonCollapseIcon() {
+  return (
+    <svg {...ribbonIconSvgProps}>
+      <path d="M4 14v6h6M20 10h-6V4M4 10l6-6M20 14l-6 6" />
+    </svg>
+  )
+}
+
+function RibbonCloseIcon() {
+  return (
+    <svg {...ribbonIconSvgProps}>
+      <path d="M18 6L6 18M6 6l12 12" />
+    </svg>
+  )
+}
+
 const ComponentVisual = ({ component }: { component: CircuitComponent }) => {
   const { kind } = component
   if (kind === 'battery') {
@@ -536,7 +575,7 @@ function App() {
   }
 
   const handleComponentClick = (
-    event: React.MouseEvent<HTMLButtonElement>,
+    event: React.MouseEvent<HTMLElement>,
     component: CircuitComponent,
   ) => {
     event.stopPropagation()
@@ -930,6 +969,13 @@ function App() {
         scale: 2,
         logging: false,
         useCORS: true,
+        /** Skip simulation animation dot (not part of schematic). */
+        ignoreElements: (node) =>
+          node instanceof Element && node.classList.contains('sim-dot'),
+        /** Backup: strip sim-dot from clone (some engines still rasterize ignored SVG nodes). */
+        onclone: (clonedDoc) => {
+          clonedDoc.querySelectorAll('.sim-dot').forEach((el) => el.remove())
+        },
       })
       const dataUrl =
         format === 'png'
@@ -1040,29 +1086,22 @@ function App() {
             <div className="calculation-ribbon-toolbar">
               <button
                 type="button"
-                className="ribbon-tool-button"
-                disabled={calculationRibbonExpanded}
-                onClick={() => setCalculationRibbonExpanded(true)}
-                title="Show more of the message"
+                className="ribbon-tool-button ribbon-toggle-button"
+                onClick={() => setCalculationRibbonExpanded((expanded) => !expanded)}
+                title={calculationRibbonExpanded ? 'Collapse' : 'Expand'}
+                aria-expanded={calculationRibbonExpanded}
+                aria-label={calculationRibbonExpanded ? 'Collapse calculation message' : 'Expand calculation message'}
               >
-                Expand
-              </button>
-              <button
-                type="button"
-                className="ribbon-tool-button"
-                disabled={!calculationRibbonExpanded}
-                onClick={() => setCalculationRibbonExpanded(false)}
-                title="Use a shorter preview"
-              >
-                Contract
+                {calculationRibbonExpanded ? <RibbonCollapseIcon /> : <RibbonExpandIcon />}
               </button>
               <button
                 type="button"
                 className="ribbon-tool-button ribbon-close-button"
                 onClick={() => setCalculationRibbonDismissed(true)}
-                title="Hide this message"
+                title="Close"
+                aria-label="Close calculation message"
               >
-                Close
+                <RibbonCloseIcon />
               </button>
             </div>
             <div
@@ -1103,13 +1142,24 @@ function App() {
             )}
           </svg>
           {components.map((component) => (
-            <button
+            <div
               key={component.id}
-              type="button"
+              role="button"
+              tabIndex={0}
               className={`component-node ${component.orientation} ${selectedComponentId === component.id ? 'selected' : ''}`}
               style={{ left: component.x, top: component.y }}
               onMouseDown={(event) => beginDrag(event, component)}
               onClick={(event) => handleComponentClick(event, component)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' || event.key === ' ') {
+                  event.preventDefault()
+                  setSelectedComponentId(component.id)
+                  setSelectedWireId(null)
+                  if (activeTool !== 'wire') {
+                    setActiveTool(component.kind)
+                  }
+                }
+              }}
             >
               <ComponentVisual component={component} />
               <span className={`terminal-dot ${component.orientation === 'vertical' ? 'top' : 'left'}`} />
@@ -1148,7 +1198,7 @@ function App() {
                 </button>
               )}
               <span className="component-value">{getComponentValueText(component)}</span>
-            </button>
+            </div>
           ))}
         </div>
       </section>
