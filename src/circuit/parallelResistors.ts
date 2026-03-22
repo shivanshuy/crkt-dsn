@@ -4,7 +4,7 @@
  * Kuphaldt DC Ch.6 — parallel / current divider.
  */
 
-import type { CircuitComponent, Wire } from './circuitTypes'
+import type { CircuitComponent, Wire } from '../types/circuit'
 import { buildUnionFind, netOf, resistorSpansNets } from './graphUtils'
 import { isSet, roundE } from './electricUtils'
 import type { KirchhoffSeriesResult } from './kirchhoffSeries'

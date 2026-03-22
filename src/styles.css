@@ -1,0 +1,854 @@
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  width: 100%;
+  height: 100%;
+  font-family: Inter, 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+}
+
+html,
+body {
+  overflow-x: hidden;
+}
+
+.app-shell {
+  position: relative;
+  display: flex;
+  height: 100vh;
+  max-width: 100%;
+  overflow: hidden;
+  background: #111827;
+  color: #f8fafc;
+}
+
+.layout-panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+/** Scroll area below toolbar / ribbon — canvas inside has a large min size */
+.layout-panel-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  -webkit-overflow-scrolling: touch;
+  /* Hide scrollbars; scrolling still works (wheel, touch, trackpad, keyboard) */
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.layout-panel-scroll::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  /* Tight sides; no left inset so logo sits closer to the edge */
+  padding: 12px 4px 12px 0;
+  border-bottom: 1px solid #334155;
+  background: #0f172a;
+  transition: padding-right 0.28s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/** Reserve same width as .properties-drawer so header actions stay left of the overlay */
+.layout-panel.layout-panel--drawer-open .toolbar {
+  padding-right: calc(4px + min(280px, 100vw));
+}
+
+.toolbar-brand {
+  display: flex;
+  align-items: center;
+  margin: 0;
+  padding: 0 1px 0 0;
+  border-right: 1px solid #334155;
+  flex-shrink: 0;
+}
+
+.toolbar-brand-logo {
+  display: block;
+  height: 38px;
+  width: auto;
+  /* viewBox 136×36 → ~144px wide at 38px tall */
+  max-width: min(144px, 50vw);
+}
+
+.tool-button {
+  border: 1px solid #475569;
+  background: #1e293b;
+  color: #e2e8f0;
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.toolbar-tool {
+  min-width: 42px;
+  height: 40px;
+  padding: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/** Text labels — same footprint as .toolbar-tool (40px row, 6px padding) */
+.toolbar-tool--text {
+  min-width: auto;
+  height: 40px;
+  padding: 6px 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+}
+
+.tool-icon-svg {
+  display: block;
+  flex-shrink: 0;
+}
+
+.tool-button.active {
+  background: #2563eb;
+  border-color: #2563eb;
+  color: #f8fafc;
+}
+
+.tool-button.simulate-button.active {
+  background: #ea580c;
+  border-color: #c2410c;
+  color: #ffffff;
+}
+
+.delete-button {
+  margin-left: auto;
+}
+
+/** Rightmost toolbar action (after Export). */
+.toolbar-clear-button {
+  flex-shrink: 0;
+}
+
+.export-submit-button {
+  border: 1px solid #14b8a6;
+  background: #0d9488;
+  color: #f0fdfa;
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 14px;
+  cursor: pointer;
+  margin-top: 4px;
+}
+
+.export-submit-button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.export-cancel-button {
+  border: 1px solid #475569;
+  background: #1e293b;
+  color: #e2e8f0;
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.export-cancel-button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.calculation-ribbon {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  background: #fef08a;
+  color: #713f12;
+  border-bottom: 1px solid #eab308;
+  font-size: 13px;
+  line-height: 1.4;
+  flex-shrink: 0;
+  transition: padding-right 0.28s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.layout-panel.layout-panel--drawer-open .calculation-ribbon {
+  padding-right: calc(4px + min(280px, 100vw));
+}
+
+.calculation-ribbon-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px 2px;
+  border-bottom: 1px solid rgba(234, 179, 8, 0.5);
+}
+
+.ribbon-tool-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 30px;
+  min-height: 30px;
+  padding: 4px;
+  border-radius: 6px;
+  border: 1px solid #ca8a04;
+  background: #fde047;
+  color: #713f12;
+  cursor: pointer;
+}
+
+.ribbon-tool-button:hover {
+  background: #facc15;
+}
+
+.ribbon-toggle-button {
+  padding: 5px;
+}
+
+.ribbon-icon-svg {
+  display: block;
+  flex-shrink: 0;
+}
+
+.ribbon-close-button {
+  margin-left: 2px;
+  border-color: #b45309;
+  background: #fcd34d;
+}
+
+.calculation-ribbon-body {
+  white-space: pre-wrap;
+  overflow-y: auto;
+  padding: 6px 12px 8px;
+}
+
+.calculation-ribbon-body--collapsed {
+  max-height: 4.5rem;
+}
+
+.calculation-ribbon-body--expanded {
+  max-height: min(55vh, 420px);
+}
+
+@media (max-height: 500px) {
+  .calculation-ribbon-body--expanded {
+    max-height: 40vh;
+  }
+}
+
+.tool-button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.canvas {
+  position: relative;
+  flex: none;
+  width: 100%;
+  box-sizing: border-box;
+  overflow: visible;
+  background-color: #ffffff;
+  background-image:
+    linear-gradient(rgba(249, 115, 22, 0.32) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(249, 115, 22, 0.32) 1px, transparent 1px);
+  background-size: 24px 24px;
+  background-position: 0 0, 0 0;
+}
+
+.wires {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: auto;
+}
+
+.wire-line {
+  stroke: #f97316;
+  stroke-width: 3;
+  fill: none;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+  pointer-events: stroke;
+}
+
+.wire-line.selected {
+  stroke: #ea580c;
+}
+
+.wire-current-label {
+  font-size: 11px;
+  font-weight: 600;
+  fill: #0f172a;
+  stroke: #ffffff;
+  stroke-width: 4px;
+  paint-order: stroke fill;
+  pointer-events: none;
+}
+
+.bend-handle {
+  fill: #ffffff;
+  stroke: #ea580c;
+  stroke-width: 2;
+  cursor: move;
+}
+
+.sim-dot {
+  fill: #f97316;
+  stroke: #ea580c;
+  stroke-width: 2;
+}
+
+.component-node {
+  position: absolute;
+  z-index: 1;
+  width: 96px;
+  height: 48px;
+  margin: 0;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: #111827;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  user-select: none;
+  padding: 0;
+  outline: none;
+}
+
+/** Fills the node; must receive pointer events so drag hits the component (not the canvas below) */
+.component-node-body {
+  position: absolute;
+  inset: 0;
+}
+
+/** Rotates schematic, terminal dots, and battery labels together */
+.component-node-rotated {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  transform-origin: center center;
+}
+
+.component-node:focus-visible {
+  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.5);
+}
+
+/* No transform on dots — avoids compositing issues with parent rotate(); use margins to center */
+.terminal-dot {
+  position: absolute;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #111827;
+  z-index: 2;
+}
+
+.terminal-dot.left {
+  left: -3px;
+  top: 50%;
+  margin-top: -3px;
+}
+
+.terminal-dot.right {
+  right: -3px;
+  top: 50%;
+  margin-top: -3px;
+}
+
+.terminal-dot.top {
+  top: -3px;
+  left: 50%;
+  margin-left: -3px;
+}
+
+.terminal-dot.bottom {
+  bottom: -3px;
+  left: 50%;
+  margin-left: -3px;
+}
+
+.battery-terminal-label {
+  position: absolute;
+  color: #000000;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1;
+  pointer-events: none;
+}
+
+/* Horizontal: center on each dot, sit just above the dot (same vertical line as terminals) */
+.battery-terminal-label.minus {
+  left: 0;
+  top: auto;
+  bottom: calc(50% + 3px + 2px);
+  transform: translateX(-50%);
+}
+
+.battery-terminal-label.plus {
+  left: 100%;
+  top: auto;
+  bottom: calc(50% + 3px + 2px);
+  transform: translateX(-50%);
+}
+
+/* Vertical: minus above top dot, plus above bottom dot */
+.battery-terminal-label.top {
+  left: 50%;
+  top: -16px;
+  transform: translateX(-50%);
+}
+
+.battery-terminal-label.bottom {
+  left: 50%;
+  top: calc(100% + 3px - 6px - 2px);
+  transform: translate(-50%, -100%);
+}
+
+.component-node.selected {
+  border-color: rgba(251, 146, 60, 0.6);
+  box-shadow: 0 0 0 1px rgba(251, 146, 60, 0.35);
+}
+
+.component-node--spec-locked:not(.selected) {
+  border-color: rgba(100, 116, 139, 0.35);
+}
+
+.component-lock-badge {
+  position: absolute;
+  top: 0;
+  left: 2px;
+  color: #64748b;
+  line-height: 0;
+  z-index: 4;
+  pointer-events: none;
+  filter: drop-shadow(0 0 1px #fff);
+}
+
+/** Only unlocked part when others are locked — properties recomputed on Calculate */
+.component-calculate-target-badge {
+  position: absolute;
+  top: 0;
+  right: 2px;
+  color: #16a34a;
+  line-height: 0;
+  z-index: 4;
+  pointer-events: none;
+  filter: drop-shadow(0 0 1px #fff);
+}
+
+.component-calculate-target-badge__svg {
+  display: block;
+}
+
+.component-calculate-target-badge__face {
+  stroke: #ffffff;
+}
+
+.rotate-handle {
+  position: absolute;
+  top: -18px;
+  right: -18px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 1px solid #2563eb;
+  background: #ffffff;
+  color: #2563eb;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+
+.rotate-handle:hover {
+  background: #eff6ff;
+}
+
+.component-value {
+  position: absolute;
+  bottom: -16px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 10px;
+  color: #111827;
+  white-space: nowrap;
+  pointer-events: none;
+  z-index: 1;
+}
+
+/** Free-form layout notes (not part of the netlist) */
+.layout-text-note {
+  position: absolute;
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+  padding: 0;
+  border-radius: 6px;
+  border: 1px solid #fde047;
+  background: #fefce8;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+  color: #422006;
+  resize: both;
+  overflow: auto;
+}
+
+.layout-text-note--no-header {
+  padding: 6px;
+}
+
+.layout-text-note.selected {
+  border-color: #ea580c;
+  box-shadow: 0 0 0 1px rgba(251, 146, 60, 0.45);
+}
+
+.layout-text-note-drag {
+  flex-shrink: 0;
+  min-height: 14px;
+  cursor: grab;
+  border-radius: 6px 6px 0 0;
+  background: linear-gradient(180deg, rgba(254, 243, 199, 0.95), rgba(254, 249, 195, 0.4));
+  display: flex;
+  align-items: center;
+  padding: 2px 8px;
+  letter-spacing: 0.02em;
+  color: #854d0e;
+  user-select: none;
+  border-bottom: 1px solid rgba(250, 204, 21, 0.45);
+}
+
+.layout-text-note-drag:active {
+  cursor: grabbing;
+}
+
+.layout-text-note-input {
+  flex: 1;
+  display: block;
+  min-width: 0;
+  min-height: 24px;
+  width: 100%;
+  box-sizing: border-box;
+  margin: 0;
+  padding: 8px 10px 10px;
+  border: none;
+  border-radius: 0 0 5px 5px;
+  background: transparent;
+  color: #1c1917;
+  line-height: 1.35;
+  font-family: inherit;
+  resize: none;
+  outline: none;
+}
+
+.layout-text-note--no-header .layout-text-note-input {
+  border-radius: 4px;
+}
+
+.property-form-checkbox-row {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px 20px;
+}
+
+.property-form-checkbox {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 14px;
+}
+
+.property-form-checkbox input {
+  width: auto;
+  margin: 0;
+}
+
+/** Checkbox + label text on one line (overrides .property-form label column) */
+.property-form label.property-form-checkbox {
+  flex-direction: row;
+}
+
+.note-section-label {
+  margin: 10px 0 4px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #94a3b8;
+}
+
+.note-section-label:first-of-type {
+  margin-top: 0;
+}
+
+.note-font-size-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+
+.note-font-size-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: #e2e8f0;
+}
+
+.note-font-size-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.note-font-step-button {
+  min-width: 36px;
+  height: 36px;
+  padding: 0 8px;
+  border-radius: 6px;
+  border: 1px solid #475569;
+  background: #1e293b;
+  color: #e2e8f0;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.note-font-step-button:hover {
+  background: #334155;
+}
+
+.note-font-size-input {
+  width: 4.5rem;
+  text-align: center;
+}
+
+.layout-text-note-input::placeholder {
+  color: #a8a29e;
+}
+
+.layout-text-note-input:focus {
+  box-shadow: inset 0 0 0 1px rgba(234, 88, 12, 0.25);
+}
+
+.symbol-svg {
+  width: 88px;
+  height: 28px;
+  flex-shrink: 0;
+}
+
+.symbol-svg path {
+  fill: none;
+  stroke: #000000;
+  stroke-width: 1.3;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.symbol-svg-led path {
+  stroke-width: 1.4;
+}
+
+/** Right overlay — does not shrink the canvas; drawer slides over the layout */
+.properties-drawer-root {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 0;
+  z-index: 30;
+  pointer-events: none;
+}
+
+.properties-panel {
+  width: min(280px, 100vw);
+  border-left: 1px solid #334155;
+  background: #0f172a;
+  padding: 16px;
+}
+
+.properties-panel.properties-drawer {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  overflow: hidden;
+  transform: translateX(100%);
+  transition: transform 0.28s cubic-bezier(0.4, 0, 0.2, 1);
+  box-shadow: -8px 0 32px rgba(0, 0, 0, 0.45);
+  pointer-events: none;
+  will-change: transform;
+}
+
+/** Open state: higher specificity than base so pointer-events:auto wins over pointer-events:none */
+.properties-panel.properties-drawer.properties-drawer--open {
+  transform: translateX(0);
+  pointer-events: auto;
+}
+
+.properties-drawer-header {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 14px 12px 12px 16px;
+  border-bottom: 1px solid #334155;
+  background: #0f172a;
+}
+
+.properties-drawer-title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+  line-height: 1.2;
+  min-width: 0;
+}
+
+.drawer-collapse-button {
+  flex-shrink: 0;
+}
+
+.drawer-icon-svg {
+  display: block;
+}
+
+.properties-drawer-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 16px;
+}
+
+/** Edge tab — reopen drawer when collapsed */
+.drawer-tab-button {
+  position: absolute;
+  top: 50%;
+  right: 0;
+  transform: translateY(-50%);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 52px;
+  padding: 0;
+  margin: 0;
+  border: 1px solid #475569;
+  border-right: none;
+  border-radius: 8px 0 0 8px;
+  background: #1e293b;
+  color: #e2e8f0;
+  cursor: pointer;
+  pointer-events: auto;
+  box-shadow: -4px 2px 16px rgba(0, 0, 0, 0.35);
+  transition:
+    background 0.15s ease,
+    color 0.15s ease;
+}
+
+.drawer-tab-button:hover {
+  background: #334155;
+  color: #f8fafc;
+}
+
+.drawer-tab-button:focus-visible {
+  outline: 2px solid #2563eb;
+  outline-offset: 2px;
+}
+
+.hint {
+  font-size: 13px;
+  color: #94a3b8;
+}
+
+.hint--ohms {
+  margin: 0 0 4px;
+  line-height: 1.35;
+}
+
+.hint--lock {
+  margin: 0 0 6px;
+  line-height: 1.35;
+}
+
+.property-form-lock-row {
+  margin-top: 4px;
+}
+
+.property-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.property-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 13px;
+}
+
+.property-form input {
+  border: 1px solid #475569;
+  background: #111827;
+  color: #f8fafc;
+  border-radius: 6px;
+  padding: 8px;
+}
+
+.property-form-id {
+  font-family: ui-monospace, 'Cascadia Code', 'Segoe UI Mono', Consolas, monospace;
+  font-size: 12px;
+  letter-spacing: 0.02em;
+  color: #cbd5e1;
+}
+
+.property-form-id-hint {
+  margin: -4px 0 0;
+  font-size: 11px;
+  color: #94a3b8;
+  line-height: 1.35;
+}
+
+.property-form-id-hint code {
+  font-size: 10px;
+  color: #cbd5e1;
+}
+
+.property-form select {
+  border: 1px solid #475569;
+  background: #111827;
+  color: #f8fafc;
+  border-radius: 6px;
+  padding: 8px;
+}

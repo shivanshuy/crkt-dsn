@@ -4,11 +4,13 @@
  * See Kuphaldt DC Ch.6 — divider circuits & Kirchhoff’s laws.
  */
 
-import type { CircuitComponent, Wire } from './circuitTypes'
+import type { CircuitComponent, Wire } from '../types/circuit'
+import {
+  getForcedSeriesCurrentFromLockedParts,
+  isComponentPropertiesLocked,
+} from '../utils/componentLock'
 import { buildUnionFind, netOf } from './graphUtils'
 import { isSet, nearestE12Pair, roundE } from './electricUtils'
-
-export type { CircuitComponent, Wire } from './circuitTypes'
 
 export type KirchhoffSeriesResult =
   | { applicable: false }
@@ -41,15 +43,15 @@ export function tryKirchhoffSeriesBatteryLedResistor(
   const led = leds[0]
   const resistor = resistors[0]
 
+  const resistorUnlocked = !isComponentPropertiesLocked(resistor)
+  const batteryUnlocked = !isComponentPropertiesLocked(battery)
+
   const { uf, netCount } = buildUnionFind(components, wires)
 
   if (netCount !== 3) {
-    return {
-      applicable: true,
-      ok: false,
-      message:
-        'Kirchhoff (series): need exactly one closed path with battery, LED, and resistor — three separate nodes (nets). Check that all three parts are wired in one series loop.',
-    }
+    // Not a simple 3-node series graph — do not claim this solver; let runCircuitCalculate fall
+    // through to per-part Ohm’s law (and other topologies) instead of blocking with a hard error.
+    return { applicable: false }
   }
 
   if (netOf(uf, battery.id, 'left') === netOf(uf, battery.id, 'right')) {
@@ -68,6 +70,12 @@ export function tryKirchhoffSeriesBatteryLedResistor(
     isSet(led.current) ? led.current : isSet(resistor.current) ? resistor.current : battery.current
   let R = resistor.resistance
 
+  const forcedBranchCurrent = getForcedSeriesCurrentFromLockedParts([battery, led, resistor])
+  if (!forcedBranchCurrent.ok) {
+    return { applicable: true, ok: false, message: forcedBranchCurrent.message }
+  }
+  const seriesCurrentFromLock = forcedBranchCurrent.I !== null
+
   const conflict = (a: number, b: number, label: string) => {
     if (Math.abs(a - b) > 1e-6 * Math.max(1, Math.abs(a))) {
       return `${label} mismatch: ${a} vs ${b}.`
@@ -75,16 +83,24 @@ export function tryKirchhoffSeriesBatteryLedResistor(
     return null
   }
 
-  if (isSet(led.current) && isSet(resistor.current)) {
-    const err = conflict(led.current, resistor.current, 'Series current')
-    if (err) {
-      return { applicable: true, ok: false, message: err }
+  if (!seriesCurrentFromLock) {
+    if (isSet(led.current) && isSet(resistor.current)) {
+      const err = conflict(led.current, resistor.current, 'Series current')
+      if (err) {
+        return { applicable: true, ok: false, message: err }
+      }
     }
-  }
-  if (isSet(battery.current) && isSet(led.current)) {
-    const err = conflict(battery.current, led.current, 'Series current')
-    if (err) {
-      return { applicable: true, ok: false, message: err }
+    if (isSet(battery.current) && isSet(led.current)) {
+      const err = conflict(battery.current, led.current, 'Series current')
+      if (err) {
+        return { applicable: true, ok: false, message: err }
+      }
+    }
+    if (isSet(battery.current) && isSet(resistor.current)) {
+      const err = conflict(battery.current, resistor.current, 'Series current')
+      if (err) {
+        return { applicable: true, ok: false, message: err }
+      }
     }
   }
 
@@ -93,10 +109,122 @@ export function tryKirchhoffSeriesBatteryLedResistor(
   }
 
   let Vr: number | null = null
+  let kvlMismatchNote: string | null = null
 
   const need = 'Provide enough values: e.g. battery voltage, LED forward voltage, and current (or resistance) so the rest can be found from KVL and Ohm’s law.'
 
-  if (isSet(Vbat) && isSet(Vled) && isSet(I) && !isSet(R)) {
+  let solvedFromLockedBranchCurrent = false
+  let unlockedResistorSolvedByKvl = false
+  let unlockedBatterySolvedByKvl = false
+
+  if (seriesCurrentFromLock && forcedBranchCurrent.I !== null) {
+    const Ilocked = forcedBranchCurrent.I
+    I = Ilocked
+
+    // Unlocked resistor: KVL first — V_R = V_battery − V_LED, then R = V_R / I (ignore stale R on canvas).
+    if (resistorUnlocked && isSet(Vbat) && isSet(Vled)) {
+      Vr = roundE((Vbat as number) - (Vled as number))
+      if (Vr <= 0) {
+        return {
+          applicable: true,
+          ok: false,
+          message: `KVL: V_R = V_battery − V_LED = ${Vbat} − ${Vled} ≤ 0. Check voltages.`,
+        }
+      }
+      if (Math.abs(Ilocked) < 1e-15) {
+        return { applicable: true, ok: false, message: 'Current is zero — cannot compute resistance.' }
+      }
+      R = roundE(Vr / Ilocked)
+      kvlMismatchNote = null
+      unlockedResistorSolvedByKvl = true
+      solvedFromLockedBranchCurrent = true
+    } else if (batteryUnlocked && isSet(Vled) && isSet(R)) {
+      if (Math.abs(R as number) < 1e-15) {
+        return { applicable: true, ok: false, message: 'Resistance is zero — invalid.' }
+      }
+      Vr = roundE(Ilocked * (R as number))
+      Vbat = roundE((Vled as number) + Vr)
+      kvlMismatchNote = null
+      unlockedBatterySolvedByKvl = true
+      solvedFromLockedBranchCurrent = true
+    } else if (isSet(Vbat) && isSet(Vled) && isSet(R) && !resistorUnlocked) {
+      if (Math.abs(R as number) < 1e-15) {
+        return { applicable: true, ok: false, message: 'Resistance is zero — cannot compute resistor drop.' }
+      }
+      Vr = roundE(Ilocked * (R as number))
+      const vKvl = roundE((Vbat as number) - (Vled as number))
+      if (Math.abs(Vr - vKvl) > 1e-5 * Math.max(1, Math.abs(Vr), Math.abs(vKvl))) {
+        kvlMismatchNote = [
+          '',
+          'KVL check: V_battery − V_LED = ' + `${vKvl} V, but with locked branch current I = ${Ilocked} A we have V_R = I×R = ${Vr} V.`,
+          'The resistor is locked so its Ω value is kept; unlock it (and lock the others) to recompute R from KVL, or relax locked specs.',
+        ].join('\n')
+      }
+      solvedFromLockedBranchCurrent = true
+    } else if (isSet(Vbat) && isSet(Vled) && !isSet(R) && !resistorUnlocked) {
+      Vr = roundE((Vbat as number) - (Vled as number))
+      if (Vr <= 0) {
+        return {
+          applicable: true,
+          ok: false,
+          message: `KVL gives V_R = V_battery − V_LED = ${Vbat} − ${Vled} ≤ 0. Check voltages.`,
+        }
+      }
+      if (Math.abs(Ilocked) < 1e-15) {
+        return { applicable: true, ok: false, message: 'Current is zero — cannot compute resistance.' }
+      }
+      R = roundE(Vr / Ilocked)
+      solvedFromLockedBranchCurrent = true
+    } else if (isSet(Vbat) && isSet(R) && !isSet(Vled)) {
+      if (Math.abs(R as number) < 1e-15) {
+        return { applicable: true, ok: false, message: 'Resistance is zero — invalid.' }
+      }
+      Vr = roundE(Ilocked * (R as number))
+      Vled = roundE((Vbat as number) - Vr)
+      if (Vled <= 0) {
+        return {
+          applicable: true,
+          ok: false,
+          message: `Computed LED voltage would be ${Vled} V. Check battery, current, and resistance.`,
+        }
+      }
+      solvedFromLockedBranchCurrent = true
+    } else if (isSet(Vled) && isSet(R) && !isSet(Vbat)) {
+      if (Math.abs(R as number) < 1e-15) {
+        return { applicable: true, ok: false, message: 'Resistance is zero — invalid.' }
+      }
+      Vr = roundE(Ilocked * (R as number))
+      Vbat = roundE((Vled as number) + Vr)
+      solvedFromLockedBranchCurrent = true
+    }
+  }
+
+  if (seriesCurrentFromLock && !solvedFromLockedBranchCurrent) {
+    return {
+      applicable: true,
+      ok: false,
+      message:
+        'A locked part fixes branch current: provide battery voltage, LED forward voltage, and resistance (or another complete set, e.g. Vbat+R with Vf unknown) so this loop can be solved at that current.',
+    }
+  }
+
+  // Prefer Vbat + V_led + R → I when R is known (so a new R or supply after Calculate updates current).
+  // Skipped when a locked part pins branch current — series I stays that value.
+  // Otherwise Vbat + V_led + I → R when I is known but R is not.
+  if (!solvedFromLockedBranchCurrent && isSet(Vbat) && isSet(Vled) && isSet(R)) {
+    Vr = roundE(Vbat - Vled)
+    if (Vr <= 0) {
+      return {
+        applicable: true,
+        ok: false,
+        message: `KVL: V_R = V_battery − V_LED = ${Vbat} − ${Vled} ≤ 0. Check values.`,
+      }
+    }
+    if (Math.abs(R as number) < 1e-15) {
+      return { applicable: true, ok: false, message: 'Resistance is zero — cannot compute current.' }
+    }
+    I = roundE(Vr / (R as number))
+  } else if (!solvedFromLockedBranchCurrent && isSet(Vbat) && isSet(Vled) && isSet(I)) {
     Vr = roundE(Vbat - Vled)
     if (Vr <= 0) {
       return {
@@ -105,26 +233,13 @@ export function tryKirchhoffSeriesBatteryLedResistor(
         message: `KVL gives V_R = V_battery − V_LED = ${Vbat} − ${Vled} ≤ 0. Check voltages (LED forward voltage must be less than the battery).`,
       }
     }
-    if (Math.abs(I) < 1e-15) {
+    if (Math.abs(I as number) < 1e-15) {
       return { applicable: true, ok: false, message: 'Current is zero — cannot compute resistance.' }
     }
-    R = roundE(Vr / I)
-  } else if (isSet(Vbat) && isSet(Vled) && isSet(R) && !isSet(I)) {
-    Vr = roundE(Vbat - Vled)
-    if (Vr <= 0) {
-      return {
-        applicable: true,
-        ok: false,
-        message: `KVL: V_R = V_battery − V_LED = ${Vbat} − ${Vled} ≤ 0. Check values.`,
-      }
-    }
-    if (Math.abs(R) < 1e-15) {
-      return { applicable: true, ok: false, message: 'Resistance is zero — cannot compute current.' }
-    }
-    I = roundE(Vr / R)
-  } else if (isSet(Vbat) && isSet(I) && isSet(R) && !isSet(Vled)) {
-    Vr = roundE(I * R)
-    Vled = roundE(Vbat - Vr)
+    R = roundE(Vr / (I as number))
+  } else if (!solvedFromLockedBranchCurrent && isSet(Vbat) && isSet(I) && isSet(R)) {
+    Vr = roundE((I as number) * (R as number))
+    Vled = roundE((Vbat as number) - Vr)
     if (Vled <= 0) {
       return {
         applicable: true,
@@ -132,24 +247,10 @@ export function tryKirchhoffSeriesBatteryLedResistor(
         message: `Computed LED voltage would be ${Vled} V (not valid as a forward drop). Check I and R.`,
       }
     }
-  } else if (isSet(Vled) && isSet(I) && isSet(R) && !isSet(Vbat)) {
-    Vr = roundE(I * R)
-    Vbat = roundE(Vled + Vr)
-  } else if (isSet(Vbat) && isSet(Vled) && isSet(R) && isSet(I)) {
-    Vr = roundE(Vbat - Vled)
-    if (Vr <= 0) {
-      return {
-        applicable: true,
-        ok: false,
-        message: `KVL: V_R = V_battery − V_LED = ${Vbat} − ${Vled} ≤ 0. Check values.`,
-      }
-    }
-    const Rcalc = Vr / I
-    const err = conflict(R, Rcalc, 'Resistance')
-    if (err) {
-      return { applicable: true, ok: false, message: `${err} KVL + Ohm’s law expect R ≈ ${roundE(Rcalc)} Ω.` }
-    }
-  } else {
+  } else if (!solvedFromLockedBranchCurrent && isSet(Vled) && isSet(I) && isSet(R)) {
+    Vr = roundE((I as number) * (R as number))
+    Vbat = roundE((Vled as number) + Vr)
+  } else if (!solvedFromLockedBranchCurrent) {
     return { applicable: true, ok: false, message: need }
   }
 
@@ -157,7 +258,11 @@ export function tryKirchhoffSeriesBatteryLedResistor(
     return { applicable: true, ok: false, message: need }
   }
 
-  Vr = roundE(Vbat - Vled)
+  if (Vr === null) {
+    Vr = roundE((Vbat as number) - (Vled as number))
+  } else {
+    Vr = roundE(Vr)
+  }
   const Iseries = roundE(I)
   const Rfinal = roundE(R)
   const VbatOut = roundE(Vbat)
@@ -165,26 +270,78 @@ export function tryKirchhoffSeriesBatteryLedResistor(
 
   const { lower, upper } = nearestE12Pair(Rfinal)
 
+  const useLockedResistorIxRNarrative =
+    solvedFromLockedBranchCurrent &&
+    !unlockedResistorSolvedByKvl &&
+    !unlockedBatterySolvedByKvl
+
+  let kvlIntro: string[]
+  if (unlockedResistorSolvedByKvl) {
+    kvlIntro = [
+      'Branch current comes from locked part(s) (KCL). The resistor is the only unlocked part, so KVL fixes its drop and R is recomputed (the old Ω value is not kept):',
+      '',
+      `  V_R = V_battery − V_LED = ${VbatOut} V − ${VledOut} V = ${Vr} V`,
+      '',
+      `  R = V_R / I = ${Vr} / ${Iseries} = ${Rfinal} Ω`,
+    ]
+  } else if (unlockedBatterySolvedByKvl) {
+    kvlIntro = [
+      'Branch current comes from locked part(s) (KCL). The battery is the only unlocked part, so V_R = I×R from the locked resistor, then KVL gives the source voltage:',
+      '',
+      `  V_R = I × R = ${Iseries} A × ${Rfinal} Ω = ${Vr} V`,
+      '',
+      `  V_battery = V_LED + V_R = ${VledOut} V + ${Vr} V = ${VbatOut} V`,
+    ]
+  } else if (useLockedResistorIxRNarrative) {
+    kvlIntro = [
+      'One or more locked parts pin branch current, so KCL uses that current everywhere in this loop.',
+      'The resistor is locked, so its resistance stays fixed; drop uses I×R:',
+      '',
+      `  V_R = I × R = ${Iseries} A × ${Rfinal} Ω = ${Vr} V`,
+      '',
+      'KVL cross-check with listed battery and LED forward voltage:',
+      '',
+      '  V_battery = V_LED + V_R  →  V_R from KVL would be ' +
+        `${VbatOut} V − ${VledOut} V = ${roundE(VbatOut - VledOut)} V`,
+    ]
+  } else {
+    kvlIntro = [
+      'Kirchhoff’s voltage law (KVL)',
+      'Around the loop, the source voltage equals the sum of the drops:',
+      '',
+      '  V_battery = V_LED + V_R',
+      '',
+      'So the voltage across the resistor is:',
+      '',
+      `  V_R = ${VbatOut} V − ${VledOut} V = ${Vr} V`,
+    ]
+  }
+
+  const resistorOhmLines =
+    unlockedResistorSolvedByKvl || unlockedBatterySolvedByKvl
+      ? []
+      : useLockedResistorIxRNarrative
+        ? [
+            `Locked resistor value: ${Rfinal} Ω (unlock the resistor and lock the others to recompute R from KVL).`,
+          ]
+        : [
+            'Ohm’s law for the resistor:',
+            '',
+            `  R = V_R / I = ${Vr} / ${Iseries} = ${Rfinal} Ω`,
+          ]
+
   const explanation = [
-    'Kirchhoff’s voltage law (KVL)',
-    'Around the loop, the source voltage equals the sum of the drops:',
-    '',
-    '  V_battery = V_LED + V_R',
-    '',
-    'So the voltage across the resistor is:',
-    '',
-    `  V_R = ${VbatOut} V − ${VledOut} V = ${Vr} V`,
+    ...kvlIntro,
     '',
     'Kirchhoff’s current law (KCL) in series: the same current flows everywhere, so',
     '',
     `  I = ${Iseries} A`,
     'through the resistor (and the LED).',
     '',
-    'Ohm’s law for the resistor:',
-    '',
-    `  R = V_R / I = ${Vr} / ${Iseries} = ${Rfinal} Ω`,
+    ...resistorOhmLines,
     '',
     `Nearest common E12 values near ${Rfinal} Ω: ${lower} Ω and ${upper} Ω — pick the closest, then check that current stays near your target (e.g. 20 mA).`,
+    ...(kvlMismatchNote ? [kvlMismatchNote] : []),
   ].join('\n')
 
   const next: CircuitComponent[] = components.map((c) => {

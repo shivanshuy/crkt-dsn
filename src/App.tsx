@@ -1,360 +1,88 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import html2canvas from 'html2canvas'
 import {
   COMPONENT_DEFAULTS,
   DEFAULT_LED_COLOR,
+  defaultPropertiesLocked,
   getLedDefaults,
-  LED_COLOR_OPTIONS,
+  isComponentPlacementTool,
   type LedColor,
 } from './config'
-import { tryKirchhoffSeriesBatteryLedResistor } from './circuit/kirchhoffSeries'
-import { tryParallelResistorsBank } from './circuit/parallelResistors'
-import { trySeriesResistorChain } from './circuit/seriesResistorChain'
-import './App.css'
-
-type ComponentKind = 'battery' | 'resistor' | 'led' | 'capacitor'
-type Tool = ComponentKind | 'wire' | 'none'
-
-const LED_COLOR_HEX: Record<LedColor, string> = {
-  red: '#dc2626',
-  green: '#16a34a',
-  blue: '#2563eb',
-  yellow: '#ca8a04',
-  orange: '#ea580c',
-  white: '#9ca3af',
-  purple: '#9333ea',
-}
-
-type CircuitComponent = {
-  id: string
-  kind: ComponentKind
-  x: number
-  y: number
-  orientation: 'horizontal' | 'vertical'
-  /** Visual color for LED symbol (ignored for other kinds) */
-  ledColor: LedColor
-  /** null = not specified (used with Ohm’s-law fill in simulate mode) */
-  voltage: number | null
-  current: number | null
-  resistance: number | null
-  capacitance: number
-}
-
-type Point = {
-  x: number
-  y: number
-}
-
-type TerminalSide = 'left' | 'right'
-
-type TerminalRef = {
-  componentId: string
-  side: TerminalSide
-}
-
-type Wire = {
-  id: string
-  from: TerminalRef
-  to: TerminalRef
-  waypoints: Point[]
-}
-
-type PathEdge = {
-  to: string
-  points: Point[]
-}
-
-const GRID_SIZE = 24
-
-const toolLabels: Record<Tool, string> = {
-  none: '',
-  battery: 'Battery',
-  resistor: 'Resistor',
-  led: 'LED',
-  capacitor: 'Capacitor',
-  wire: 'Wire',
-}
-
-const kindLabels: Record<ComponentKind, string> = {
-  battery: 'Battery',
-  resistor: 'Resistor',
-  led: 'LED',
-  capacitor: 'Capacitor',
-}
-
-/** Multiples of GRID_SIZE so tops/edges sit on grid lines */
-const COMPONENT_WIDTH = 96
-const COMPONENT_HEIGHT = 48
-
-const isElectricValueSet = (n: number | null | undefined): n is number =>
-  n !== null && n !== undefined && Number.isFinite(n)
-
-const roundElectric = (n: number) => Math.round(n * 1_000_000) / 1_000_000
-
-/** Ohm’s law: V = I × R — used when user clicks Calculate in simulate mode */
-function computeOhmsForComponent(
-  component: CircuitComponent,
-  kindLabelsMap: Record<ComponentKind, string>,
-): { component: CircuitComponent; issues: string[] } {
-  const label = kindLabelsMap[component.kind]
-  /** LEDs use forward voltage + current only; never compute or store resistance. */
-  if (component.kind === 'led') {
-    return { component: { ...component, resistance: null }, issues: [] }
-  }
-  const v = component.voltage
-  const i = component.current
-  const r = component.resistance
-
-  const hasV = isElectricValueSet(v)
-  const hasI = isElectricValueSet(i)
-  const hasR = isElectricValueSet(r)
-  const knownCount = [hasV, hasI, hasR].filter(Boolean).length
-
-  if (knownCount === 0 || knownCount === 3) {
-    return { component, issues: [] }
-  }
-
-  if (knownCount === 1) {
-    return {
-      component,
-      issues: [
-        `${label}: need two of voltage, current, and resistance to compute the third (V = I × R).`,
-      ],
-    }
-  }
-
-  let nv: number | null = v
-  let ni: number | null = i
-  let nr: number | null = r
-
-  if (hasV && hasI && !hasR) {
-    if (Math.abs(i as number) < 1e-15) {
-      return {
-        component,
-        issues: [`${label}: current is zero — cannot compute resistance (V ÷ I).`],
-      }
-    }
-    nr = roundElectric((v as number) / (i as number))
-  } else if (hasV && hasR && !hasI) {
-    if (Math.abs(r as number) < 1e-15) {
-      return {
-        component,
-        issues: [`${label}: resistance is zero — cannot compute current (V ÷ R).`],
-      }
-    }
-    ni = roundElectric((v as number) / (r as number))
-  } else if (hasI && hasR && !hasV) {
-    nv = roundElectric((i as number) * (r as number))
-  }
-
-  return { component: { ...component, voltage: nv, current: ni, resistance: nr }, issues: [] }
-}
-
-function runOhmsCalculate(
-  list: CircuitComponent[],
-  kindLabelsMap: Record<ComponentKind, string>,
-): { next: CircuitComponent[]; message: string | null } {
-  const issues: string[] = []
-  const next = list.map((component) => {
-    const result = computeOhmsForComponent(component, kindLabelsMap)
-    issues.push(...result.issues)
-    return result.component
-  })
-  return {
-    next,
-    message: issues.length > 0 ? issues.join(' • ') : null,
-  }
-}
-
-/**
- * Kirchhoff-based analysis when topology matches (see Kuphaldt DC Ch.6 — dividers & KVL/KCL):
- * 1) battery + LED + resistor series loop, 2) battery + N resistors in series, 3) parallel resistor bank.
- * Otherwise per-component Ohm’s law.
- */
-function runCircuitCalculate(
-  list: CircuitComponent[],
-  wires: Wire[],
-  kindLabelsMap: Record<ComponentKind, string>,
-): { next: CircuitComponent[]; message: string | null } {
-  const ledLoop = tryKirchhoffSeriesBatteryLedResistor(list, wires)
-  if (ledLoop.applicable) {
-    if (ledLoop.ok) {
-      return { next: ledLoop.next, message: ledLoop.explanation }
-    }
-    return { next: list, message: ledLoop.message }
-  }
-  const seriesR = trySeriesResistorChain(list, wires)
-  if (seriesR.applicable) {
-    if (seriesR.ok) {
-      return { next: seriesR.next, message: seriesR.explanation }
-    }
-    return { next: list, message: seriesR.message }
-  }
-  const parallelR = tryParallelResistorsBank(list, wires)
-  if (parallelR.applicable) {
-    if (parallelR.ok) {
-      return { next: parallelR.next, message: parallelR.explanation }
-    }
-    return { next: list, message: parallelR.message }
-  }
-  return runOhmsCalculate(list, kindLabelsMap)
-}
-
-function parseNumberOrNull(raw: string): number | null {
-  const trimmed = raw.trim()
-  if (trimmed === '') {
-    return null
-  }
-  const parsed = Number(trimmed)
-  return Number.isFinite(parsed) ? parsed : null
-}
-
-function sanitizeExportBaseName(name: string): string {
-  const stripped = name
-    .replace(/\.(png|jpg|jpeg)$/i, '')
-    .replace(/[/\\?%*:|"<>]/g, '-')
-    .trim()
-  const collapsed = stripped.replace(/\s+/g, '-').replace(/-+/g, '-')
-  const clipped = collapsed.slice(0, 120)
-  return clipped.length > 0 ? clipped : 'crkt-export'
-}
-
-const toolIconSvgProps = {
-  className: 'tool-icon-svg',
-  viewBox: '0 0 24 24',
-  width: 22,
-  height: 22,
-  fill: 'none',
-  stroke: 'currentColor',
-  strokeWidth: 1.65,
-  strokeLinecap: 'round' as const,
-  strokeLinejoin: 'round' as const,
-  'aria-hidden': true as const,
-}
-
-function ToolIcon({ tool }: { tool: Exclude<Tool, 'none'> }) {
-  switch (tool) {
-    case 'battery':
-      return (
-        <svg {...toolIconSvgProps}>
-          <path d="M3 12h4M17 12h4" />
-          <path d="M8 7v10M12 5v14" />
-        </svg>
-      )
-    case 'resistor':
-      return (
-        <svg {...toolIconSvgProps}>
-          <path d="M2 12h2.5l2-3.5 2.5 7 2.5-7 2.5 7 2.5-7 2.5 3.5H22" />
-        </svg>
-      )
-    case 'led':
-      return (
-        <svg {...toolIconSvgProps}>
-          <path d="M3 12h4l7-6v12L7 12H3" />
-          <path d="M14 7l3 3-3 3M14 17l3-3-3-3" />
-          <path d="M19 12h2.5" />
-        </svg>
-      )
-    case 'capacitor':
-      return (
-        <svg {...toolIconSvgProps}>
-          <path d="M3 12h5M16 12h5" />
-          <path d="M10 5v14M14 5v14" />
-        </svg>
-      )
-    case 'wire':
-      return (
-        <svg {...toolIconSvgProps}>
-          <path d="M3 12h18" />
-        </svg>
-      )
-  }
-}
-
-const ribbonIconSvgProps = {
-  className: 'ribbon-icon-svg',
-  viewBox: '0 0 24 24',
-  width: 18,
-  height: 18,
-  fill: 'none',
-  stroke: 'currentColor',
-  strokeWidth: 2,
-  strokeLinecap: 'round' as const,
-  strokeLinejoin: 'round' as const,
-  'aria-hidden': true as const,
-}
-
-/** Maximize-style corners — “show more” */
-function RibbonExpandIcon() {
-  return (
-    <svg {...ribbonIconSvgProps}>
-      <path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7" />
-    </svg>
-  )
-}
-
-/** Minimize-style corners — “show less” */
-function RibbonCollapseIcon() {
-  return (
-    <svg {...ribbonIconSvgProps}>
-      <path d="M4 14v6h6M20 10h-6V4M4 10l6-6M20 14l-6 6" />
-    </svg>
-  )
-}
-
-function RibbonCloseIcon() {
-  return (
-    <svg {...ribbonIconSvgProps}>
-      <path d="M18 6L6 18M6 6l12 12" />
-    </svg>
-  )
-}
-
-const ComponentVisual = ({ component }: { component: CircuitComponent }) => {
-  const { kind } = component
-  if (kind === 'battery') {
-    return (
-      <svg className="symbol-svg" viewBox="0 0 64 24" aria-hidden="true">
-        <path d="M1 12 H22 M22 6 V18 M32 3 V21 M32 12 H63" />
-      </svg>
-    )
-  }
-  if (kind === 'resistor') {
-    return (
-      <svg className="symbol-svg" viewBox="0 0 64 24" aria-hidden="true">
-        <path d="M1 12 H10 L16 6 L24 18 L32 6 L40 18 L48 6 L54 12 H63" />
-      </svg>
-    )
-  }
-  if (kind === 'capacitor') {
-    return (
-      <svg className="symbol-svg" viewBox="0 0 64 24" aria-hidden="true">
-        <path d="M1 12 H24 M24 4 V20 M40 4 V20 M40 12 H63" />
-      </svg>
-    )
-  }
-  if (kind === 'led') {
-    const stroke = LED_COLOR_HEX[component.ledColor]
-    return (
-      <svg className="symbol-svg symbol-svg-led" viewBox="0 0 64 24" aria-hidden="true">
-        <path
-          d="M1 12 H18 M46 12 H63 M18 4 V20 M18 4 L46 12 L18 20"
-          style={{ stroke }}
-        />
-      </svg>
-    )
-  }
-  return (
-    <svg className="symbol-svg" viewBox="0 0 64 24" aria-hidden="true">
-      <path d="M1 12 H18 M46 12 H63 M18 4 V20 M18 4 L46 12 L18 20" />
-    </svg>
-  )
-}
+import {
+  createComponentId,
+  createTextNoteId,
+  createWireId,
+  resetLayoutEntityIdCounters,
+} from './ids'
+import { getAllTerminalKeys } from './circuit/graphUtils'
+import { runCircuitCalculate } from './circuit/ohmsCompute'
+import { applyWireCurrentPatch } from './circuit/wireComputedCurrent'
+import {
+  CANVAS_MIN_HEIGHT,
+  CANVAS_MIN_WIDTH,
+  GRID_SIZE,
+  TEXT_NOTE_DEFAULT_HEIGHT_PX,
+  TEXT_NOTE_DEFAULT_WIDTH_PX,
+  TEXT_NOTE_FONT_SIZE_DEFAULT_PX,
+  TEXT_NOTE_FONT_SIZE_MAX_PX,
+  TEXT_NOTE_FONT_SIZE_MIN_PX,
+  TEXT_NOTE_HEADER_FONT_DEFAULT_PX,
+  TEXT_NOTE_MIN_HEIGHT_PX,
+  TEXT_NOTE_MIN_WIDTH_PX,
+} from './constants/layout'
+import { EXPORT_DEFAULT_BASENAME } from './constants/export'
+import { kindLabels, toolLabels } from './constants/labels'
+import { ComponentVisual } from './components/canvas/ComponentVisual'
+import { LayoutTextNoteCanvas } from './components/canvas/LayoutTextNoteCanvas'
+import { DrawerCloseChevronIcon, DrawerOpenChevronIcon } from './components/canvas/DrawerIcons'
+import {
+  RibbonCloseIcon,
+  RibbonCollapseIcon,
+  RibbonExpandIcon,
+} from './components/canvas/RibbonIcons'
+import { CrktDsnWordmark } from './components/brand/CrktDsnWordmark'
+import { ToolIcon } from './components/canvas/ToolIcons'
+import { ComponentSpecPropertyFields } from './components/properties/ComponentSpecPropertyFields'
+import { computeDiagramBounds, getExportCropRect } from './export/exportCrop'
+import { getLayoutExportHtml2CanvasOptions } from './export/html2canvasLayout'
+import { getTerminalWorldPoint, terminalSideFromPointerEvent } from './geometry/componentTerminals'
+import { appendOrthogonalPoint, expandOrthogonalPath } from './geometry/orthogonalPaths'
+import { getPathPointAt } from './geometry/polyline'
+import type {
+  CircuitComponent,
+  LayoutTextNote,
+  PathEdge,
+  Point,
+  RotationDeg,
+  TerminalRef,
+  TerminalSide,
+  Tool,
+  Wire,
+} from './types/circuit'
+import {
+  applyCalculationByComponentId,
+  getComponentById,
+  isComponentPropertiesLocked,
+  patchComponentById,
+} from './utils/componentIdentity'
+import { getComponentValueText } from './utils/componentValueText'
+import { sanitizeExportBaseName } from './utils/exportFile'
+import { gridDeltaFromArrowKey } from './utils/gridNavigation'
+import { isEditableKeyboardTarget } from './utils/keyboardCanvas'
+import { parseNumberOrNull } from './utils/parse'
+import {
+  clampTextFontSize,
+  clampTextNoteSize,
+  resolveLayoutTextNote,
+} from './utils/layoutTextNote'
+import { terminalKey } from './utils/terminal'
 
 function App() {
   const [activeTool, setActiveTool] = useState<Tool>('none')
   const [components, setComponents] = useState<CircuitComponent[]>([])
   const [wires, setWires] = useState<Wire[]>([])
+  const [textNotes, setTextNotes] = useState<LayoutTextNote[]>([])
+  const [selectedTextNoteId, setSelectedTextNoteId] = useState<string | null>(null)
   const [selectedComponentId, setSelectedComponentId] = useState<string | null>(null)
   const [selectedWireId, setSelectedWireId] = useState<string | null>(null)
   const [draftWire, setDraftWire] = useState<{ from: TerminalRef; waypoints: Point[] } | null>(null)
@@ -367,25 +95,107 @@ function App() {
   const [calculationRibbonExpanded, setCalculationRibbonExpanded] = useState(false)
   const [isExporting, setIsExporting] = useState(false)
   const [showExportPanel, setShowExportPanel] = useState(false)
+  /** Right properties / export panel — closed by default; persisted only when explicitly opened (`'1'`). */
+  const [isPropertiesDrawerOpen, setIsPropertiesDrawerOpen] = useState(() => {
+    try {
+      return localStorage.getItem('crkt-dsn-properties-drawer') === '1'
+    } catch {
+      return false
+    }
+  })
   const [exportFileName, setExportFileName] = useState('')
-  const [exportFormat, setExportFormat] = useState<'png' | 'jpeg'>('png')
+  const [exportFormat, setExportFormat] = useState<'png' | 'jpeg' | 'pdf'>('png')
   const canvasRef = useRef<HTMLDivElement | null>(null)
+  const layoutPanelScrollRef = useRef<HTMLDivElement | null>(null)
   const dragInfoRef = useRef<{
     id: string
     offsetX: number
     offsetY: number
   } | null>(null)
   const bendDragRef = useRef<{ wireId: string; waypointIndex: number } | null>(null)
+  const noteDragRef = useRef<{ id: string; offsetX: number; offsetY: number } | null>(null)
 
+  /** Same object as the matching canvas node — keyed only by {@link selectedComponentId}. */
   const selectedComponent = useMemo(
-    () => components.find((component) => component.id === selectedComponentId) ?? null,
+    () => getComponentById(components, selectedComponentId),
     [components, selectedComponentId],
   )
 
-  const isLayoutEmpty = components.length === 0 && wires.length === 0
+  const selectedTextNote = useMemo(
+    () => textNotes.find((note) => note.id === selectedTextNoteId) ?? null,
+    [textNotes, selectedTextNoteId],
+  )
+
+  const selectedWire = useMemo(
+    () => wires.find((w) => w.id === selectedWireId) ?? null,
+    [wires, selectedWireId],
+  )
+
+  const resolvedSelectedTextNote = useMemo(
+    () => (selectedTextNote ? resolveLayoutTextNote(selectedTextNote) : null),
+    [selectedTextNote],
+  )
+
+  const isCircuitEmpty = components.length === 0 && wires.length === 0
+  const isLayoutEmpty = isCircuitEmpty && textNotes.length === 0
+
+  /**
+   * When any part is locked, Calculate updates exactly one unlocked part; that row is marked on canvas.
+   */
+  const calculateTargetComponentId = useMemo(() => {
+    if (components.length === 0) {
+      return null
+    }
+    const anyLocked = components.some(isComponentPropertiesLocked)
+    if (!anyLocked) {
+      return null
+    }
+    const unlocked = components.filter((c) => !isComponentPropertiesLocked(c))
+    if (unlocked.length !== 1) {
+      return null
+    }
+    return unlocked[0].id
+  }, [components])
 
   const snap = (value: number) => Math.round(value / GRID_SIZE) * GRID_SIZE
   const batteryId = components.find((component) => component.kind === 'battery')?.id ?? null
+
+  /** Clear highlighted tool on the left toolbar and cancel an in-progress wire. */
+  const clearPlacementTool = useCallback(() => {
+    setActiveTool('none')
+    setDraftWire(null)
+  }, [])
+
+  /** Remove everything on the canvas, reset simulation/calculate UI, id counters, and drag state. */
+  const clearEntireLayout = useCallback(() => {
+    if (
+      !window.confirm(
+        'Clear the entire layout? All components, wires, and notes will be removed and new parts will get fresh ids (B_1, R_1, …).',
+      )
+    ) {
+      return
+    }
+    clearPlacementTool()
+    resetLayoutEntityIdCounters()
+    dragInfoRef.current = null
+    bendDragRef.current = null
+    noteDragRef.current = null
+    setComponents([])
+    setWires([])
+    setTextNotes([])
+    setSelectedComponentId(null)
+    setSelectedWireId(null)
+    setSelectedTextNoteId(null)
+    setIsSimulating(false)
+    setSimulationProgress(0)
+    setCalculationMessage(null)
+    setCalculationRibbonDismissed(false)
+    setCalculationRibbonExpanded(false)
+    setShowExportPanel(false)
+    setExportFileName('')
+    setIsExporting(false)
+    layoutPanelScrollRef.current?.scrollTo({ top: 0, left: 0, behavior: 'auto' })
+  }, [clearPlacementTool])
 
   const getCanvasPoint = (event: React.MouseEvent<HTMLDivElement>) => {
     const rect = canvasRef.current?.getBoundingClientRect()
@@ -403,76 +213,7 @@ function App() {
     if (!component) {
       return null
     }
-    if (component.orientation === 'vertical') {
-      return {
-        x: component.x + COMPONENT_WIDTH / 2,
-        y: terminal.side === 'left' ? component.y : component.y + COMPONENT_HEIGHT,
-      }
-    }
-    return {
-      x: terminal.side === 'left' ? component.x : component.x + COMPONENT_WIDTH,
-      y: component.y + COMPONENT_HEIGHT / 2,
-    }
-  }
-
-  const getPathPointAt = (points: Point[], normalizedDistance: number): Point | null => {
-    if (points.length < 2) {
-      return null
-    }
-    const segmentLengths: number[] = []
-    let totalLength = 0
-    for (let index = 1; index < points.length; index += 1) {
-      const dx = points[index].x - points[index - 1].x
-      const dy = points[index].y - points[index - 1].y
-      const length = Math.hypot(dx, dy)
-      segmentLengths.push(length)
-      totalLength += length
-    }
-    if (totalLength === 0) {
-      return points[0]
-    }
-    const target = normalizedDistance * totalLength
-    let traversed = 0
-    for (let index = 1; index < points.length; index += 1) {
-      const segmentLength = segmentLengths[index - 1]
-      if (traversed + segmentLength >= target) {
-        const localRatio = (target - traversed) / segmentLength
-        return {
-          x: points[index - 1].x + (points[index].x - points[index - 1].x) * localRatio,
-          y: points[index - 1].y + (points[index].y - points[index - 1].y) * localRatio,
-        }
-      }
-      traversed += segmentLength
-    }
-    return points[points.length - 1]
-  }
-
-  const terminalKey = (terminal: TerminalRef) => `${terminal.componentId}:${terminal.side}`
-
-  const appendOrthogonalPoint = (from: Point, to: Point): Point => {
-    const dx = Math.abs(to.x - from.x)
-    const dy = Math.abs(to.y - from.y)
-    if (dx >= dy) {
-      return { x: to.x, y: from.y }
-    }
-    return { x: from.x, y: to.y }
-  }
-
-  const expandOrthogonalPath = (points: Point[]): Point[] => {
-    if (points.length < 2) {
-      return points
-    }
-    const expanded: Point[] = [points[0]]
-    for (let i = 1; i < points.length; i += 1) {
-      const previous = points[i - 1]
-      const current = points[i]
-      if (previous.x === current.x || previous.y === current.y) {
-        expanded.push(current)
-      } else {
-        expanded.push({ x: current.x, y: previous.y }, current)
-      }
-    }
-    return expanded
+    return getTerminalWorldPoint(component, terminal)
   }
 
   const handleCanvasClick = (event: React.MouseEvent<HTMLDivElement>) => {
@@ -480,14 +221,12 @@ function App() {
     if (clickedElement.closest('.component-node')) {
       return
     }
-    if (
-      activeTool === 'battery' ||
-      activeTool === 'resistor' ||
-      activeTool === 'led' ||
-      activeTool === 'capacitor'
-    ) {
+    if (clickedElement.closest('.layout-text-note')) {
+      return
+    }
+    if (isComponentPlacementTool(activeTool)) {
       const point = getCanvasPoint(event)
-      const id = crypto.randomUUID()
+      const id = createComponentId(activeTool)
       const ledPlace = getLedDefaults(COMPONENT_DEFAULTS.led.defaultColor)
       setComponents((previous) => [
         ...previous,
@@ -496,7 +235,7 @@ function App() {
           kind: activeTool,
           x: snap(point.x),
           y: snap(point.y),
-          orientation: 'horizontal',
+          rotationDeg: 0,
           ledColor: DEFAULT_LED_COLOR,
           voltage:
             activeTool === 'battery'
@@ -505,12 +244,40 @@ function App() {
                 ? ledPlace.voltage
                 : null,
           current: activeTool === 'led' ? ledPlace.current : null,
-          resistance: activeTool === 'resistor' ? COMPONENT_DEFAULTS.resistor.resistance : null,
-          capacitance: activeTool === 'capacitor' ? COMPONENT_DEFAULTS.capacitor.capacitance : 0,
+          resistance: null,
+          capacitance: activeTool === 'capacitor' ? null : 0,
+          propertiesLocked: defaultPropertiesLocked(activeTool),
         },
       ])
       setSelectedComponentId(id)
       setSelectedWireId(null)
+      setSelectedTextNoteId(null)
+    } else if (activeTool === 'text') {
+      const point = getCanvasPoint(event)
+      const id = createTextNoteId()
+      setTextNotes((previous) => [
+        ...previous,
+        {
+          id,
+          x: snap(point.x),
+          y: snap(point.y),
+          text: '',
+          width: TEXT_NOTE_DEFAULT_WIDTH_PX,
+          height: TEXT_NOTE_DEFAULT_HEIGHT_PX,
+          showHeader: true,
+          headerText: 'T',
+          headerFontSizePx: TEXT_NOTE_HEADER_FONT_DEFAULT_PX,
+          headerBold: true,
+          headerItalic: false,
+          textFontSizePx: TEXT_NOTE_FONT_SIZE_DEFAULT_PX,
+          textBold: false,
+          textItalic: false,
+        },
+      ])
+      setSelectedTextNoteId(id)
+      setSelectedComponentId(null)
+      setSelectedWireId(null)
+      setDraftWire(null)
     } else if (activeTool === 'wire' && draftWire) {
       const point = getCanvasPoint(event)
       const snappedPoint = { x: snap(point.x), y: snap(point.y) }
@@ -529,14 +296,12 @@ function App() {
     } else {
       setSelectedComponentId(null)
       setSelectedWireId(null)
+      setSelectedTextNoteId(null)
       setDraftWire(null)
     }
   }
 
   const beginDrag = (event: React.MouseEvent, component: CircuitComponent) => {
-    if (activeTool === 'wire') {
-      return
-    }
     event.preventDefault()
     event.stopPropagation()
     const rect = canvasRef.current?.getBoundingClientRect()
@@ -557,11 +322,8 @@ function App() {
       }
       const nextX = snap(moveEvent.clientX - rect.left - dragInfoRef.current.offsetX)
       const nextY = snap(moveEvent.clientY - rect.top - dragInfoRef.current.offsetY)
-      setComponents((previous) =>
-        previous.map((item) =>
-          item.id === dragInfoRef.current?.id ? { ...item, x: nextX, y: nextY } : item,
-        ),
-      )
+      const dragId = dragInfoRef.current.id
+      setComponents((previous) => patchComponentById(previous, dragId, { x: nextX, y: nextY }))
     }
 
     const onMouseUp = () => {
@@ -574,6 +336,53 @@ function App() {
     window.addEventListener('mouseup', onMouseUp)
   }
 
+  const beginTextNoteDrag = (event: React.MouseEvent, note: LayoutTextNote) => {
+    event.preventDefault()
+    event.stopPropagation()
+    const rect = canvasRef.current?.getBoundingClientRect()
+    if (!rect) {
+      return
+    }
+    setSelectedTextNoteId(note.id)
+    setSelectedComponentId(null)
+    setSelectedWireId(null)
+    noteDragRef.current = {
+      id: note.id,
+      offsetX: event.clientX - rect.left - note.x,
+      offsetY: event.clientY - rect.top - note.y,
+    }
+    const onMouseMove = (moveEvent: MouseEvent) => {
+      const r = canvasRef.current?.getBoundingClientRect()
+      if (!r || !noteDragRef.current) {
+        return
+      }
+      const nextX = snap(moveEvent.clientX - r.left - noteDragRef.current.offsetX)
+      const nextY = snap(moveEvent.clientY - r.top - noteDragRef.current.offsetY)
+      setTextNotes((previous) =>
+        previous.map((item) =>
+          item.id === noteDragRef.current?.id ? { ...item, x: nextX, y: nextY } : item,
+        ),
+      )
+    }
+    const onMouseUp = () => {
+      noteDragRef.current = null
+      window.removeEventListener('mousemove', onMouseMove)
+      window.removeEventListener('mouseup', onMouseUp)
+    }
+    window.addEventListener('mousemove', onMouseMove)
+    window.addEventListener('mouseup', onMouseUp)
+  }
+
+  const handleTextNoteClick = (event: React.MouseEvent, note: LayoutTextNote) => {
+    event.stopPropagation()
+    setSelectedTextNoteId(note.id)
+    setSelectedComponentId(null)
+    setSelectedWireId(null)
+    if (activeTool === 'wire') {
+      setDraftWire(null)
+    }
+  }
+
   const handleComponentClick = (
     event: React.MouseEvent<HTMLElement>,
     component: CircuitComponent,
@@ -581,19 +390,16 @@ function App() {
     event.stopPropagation()
     setSelectedComponentId(component.id)
     setSelectedWireId(null)
+    setSelectedTextNoteId(null)
     if (activeTool === 'wire') {
-      const rect = event.currentTarget.getBoundingClientRect()
-      const side: TerminalSide =
-        component.orientation === 'vertical'
-          ? event.clientY < rect.top + rect.height / 2
-            ? 'left'
-            : 'right'
-          : event.clientX < rect.left + rect.width / 2
-            ? 'left'
-            : 'right'
+      const side: TerminalSide = terminalSideFromPointerEvent(component, event)
       const clickedTerminal: TerminalRef = { componentId: component.id, side }
       if (!draftWire) {
         setDraftWire({ from: clickedTerminal, waypoints: [] })
+        return
+      }
+      if (terminalKey(draftWire.from) === terminalKey(clickedTerminal)) {
+        setDraftWire(null)
         return
       }
       const startPoint = getTerminalPoint(draftWire.from)
@@ -612,7 +418,7 @@ function App() {
       setWires((previous) => [
         ...previous,
         {
-          id: crypto.randomUUID(),
+          id: createWireId(),
           from: draftWire.from,
           to: clickedTerminal,
           waypoints,
@@ -631,11 +437,14 @@ function App() {
     if (!selectedComponentId) {
       return
     }
-    setComponents((previous) =>
-      previous.map((component) =>
-        component.id === selectedComponentId ? { ...component, [field]: value } : component,
-      ),
-    )
+    const id = selectedComponentId
+    setComponents((previous) => {
+      const c = getComponentById(previous, id)
+      if (!c || isComponentPropertiesLocked(c)) {
+        return previous
+      }
+      return patchComponentById(previous, id, { [field]: value })
+    })
   }
 
   /** Apply config defaults for V/I when the user picks another LED color (they can still edit after). */
@@ -643,34 +452,47 @@ function App() {
     if (!selectedComponentId) {
       return
     }
+    const id = selectedComponentId
     const { voltage, current } = getLedDefaults(color)
-    setComponents((previous) =>
-      previous.map((component) =>
-        component.id === selectedComponentId && component.kind === 'led'
-          ? { ...component, ledColor: color, voltage, current }
-          : component,
-      ),
-    )
+    setComponents((previous) => {
+      const c = getComponentById(previous, id)
+      if (!c || c.kind !== 'led' || isComponentPropertiesLocked(c)) {
+        return previous
+      }
+      return patchComponentById(previous, id, { ledColor: color, voltage, current })
+    })
   }
 
-  const updateSelectedOrientation = (orientation: 'horizontal' | 'vertical') => {
+  const toggleSelectedPropertiesLocked = () => {
     if (!selectedComponentId) {
       return
     }
-    setComponents((previous) =>
-      previous.map((component) =>
-        component.id === selectedComponentId ? { ...component, orientation } : component,
-      ),
-    )
+    const id = selectedComponentId
+    setComponents((previous) => {
+      const c = getComponentById(previous, id)
+      if (!c) {
+        return previous
+      }
+      return patchComponentById(previous, id, {
+        propertiesLocked: !isComponentPropertiesLocked(c),
+      })
+    })
   }
 
-  const toggleSelectedOrientation = () => {
-    if (!selectedComponent) {
+  /** Rotate handle: 90° clockwise per click (cycles 0 → 90 → 180 → 270 → 0). */
+  const rotateSelectedComponent = () => {
+    if (!selectedComponentId) {
       return
     }
-    updateSelectedOrientation(
-      selectedComponent.orientation === 'horizontal' ? 'vertical' : 'horizontal',
-    )
+    const id = selectedComponentId
+    setComponents((previous) => {
+      const c = getComponentById(previous, id)
+      if (!c) {
+        return previous
+      }
+      const next = ((c.rotationDeg + 90) % 360) as RotationDeg
+      return patchComponentById(previous, id, { rotationDeg: next })
+    })
   }
 
   const startBendDrag = (
@@ -711,75 +533,112 @@ function App() {
     window.addEventListener('mouseup', onMouseUp)
   }
 
-  const deleteSelectedComponent = () => {
-    if (!selectedComponentId) {
+  const deleteSelection = useCallback(() => {
+    if (selectedTextNoteId) {
+      const id = selectedTextNoteId
+      setTextNotes((previous) => previous.filter((note) => note.id !== id))
+      setSelectedTextNoteId(null)
       return
     }
-    setComponents((previous) => previous.filter((component) => component.id !== selectedComponentId))
-    setWires((previous) =>
-      previous.filter(
-        (wire) =>
-          wire.from.componentId !== selectedComponentId && wire.to.componentId !== selectedComponentId,
-      ),
-    )
-    if (draftWire?.from.componentId === selectedComponentId) {
-      setDraftWire(null)
-    }
-    setSelectedComponentId(null)
-  }
-
-  const deleteSelectedWire = () => {
-    if (!selectedWireId) {
-      return
-    }
-    setWires((previous) => previous.filter((wire) => wire.id !== selectedWireId))
-    setSelectedWireId(null)
-  }
-
-  const deleteSelection = () => {
     if (selectedComponentId) {
-      deleteSelectedComponent()
+      const id = selectedComponentId
+      setComponents((previous) => previous.filter((component) => component.id !== id))
+      setWires((previous) =>
+        previous.filter(
+          (wire) => wire.from.componentId !== id && wire.to.componentId !== id,
+        ),
+      )
+      setDraftWire((dw) => (dw?.from.componentId === id ? null : dw))
+      setSelectedComponentId(null)
       return
     }
     if (selectedWireId) {
-      deleteSelectedWire()
+      const id = selectedWireId
+      setWires((previous) => previous.filter((wire) => wire.id !== id))
+      setSelectedWireId(null)
     }
+  }, [selectedTextNoteId, selectedComponentId, selectedWireId])
+
+  const updateSelectedTextNote = (text: string) => {
+    if (!selectedTextNoteId) {
+      return
+    }
+    setTextNotes((previous) =>
+      previous.map((note) =>
+        note.id === selectedTextNoteId ? { ...note, text } : note,
+      ),
+    )
+  }
+
+  const patchTextNote = useCallback((id: string, patch: Partial<LayoutTextNote>) => {
+    setTextNotes((previous) =>
+      previous.map((note) => (note.id === id ? { ...note, ...patch } : note)),
+    )
+  }, [])
+
+  const patchSelectedTextNote = (patch: Partial<LayoutTextNote>) => {
+    if (!selectedTextNoteId) {
+      return
+    }
+    setTextNotes((previous) =>
+      previous.map((note) =>
+        note.id === selectedTextNoteId ? { ...note, ...patch } : note,
+      ),
+    )
   }
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Delete') {
-        deleteSelection()
+        if (!isEditableKeyboardTarget(event.target)) {
+          deleteSelection()
+        }
+        return
+      }
+      if (selectedTextNoteId) {
+        if (isEditableKeyboardTarget(event.target)) {
+          return
+        }
+        const delta = gridDeltaFromArrowKey(event.key)
+        if (!delta) {
+          return
+        }
+        event.preventDefault()
+        setTextNotes((previous) =>
+          previous.map((note) =>
+            note.id === selectedTextNoteId
+              ? { ...note, x: note.x + delta.dx, y: note.y + delta.dy }
+              : note,
+          ),
+        )
         return
       }
       if (!selectedComponentId) {
         return
       }
-      let deltaX = 0
-      let deltaY = 0
-      if (event.key === 'ArrowLeft') {
-        deltaX = -GRID_SIZE
-      } else if (event.key === 'ArrowRight') {
-        deltaX = GRID_SIZE
-      } else if (event.key === 'ArrowUp') {
-        deltaY = -GRID_SIZE
-      } else if (event.key === 'ArrowDown') {
-        deltaY = GRID_SIZE
-      } else {
+      if (isEditableKeyboardTarget(event.target)) {
+        return
+      }
+      const delta = gridDeltaFromArrowKey(event.key)
+      if (!delta) {
         return
       }
       event.preventDefault()
-      setComponents((previous) =>
-        previous.map((component) =>
-          component.id === selectedComponentId
-            ? { ...component, x: component.x + deltaX, y: component.y + deltaY }
-            : component,
-        ),
-      )
+      const moveId = selectedComponentId
+      setComponents((previous) => {
+        const c = getComponentById(previous, moveId)
+        if (!c) {
+          return previous
+        }
+        return patchComponentById(previous, moveId, {
+          x: c.x + delta.dx,
+          y: c.y + delta.dy,
+        })
+      })
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [selectedComponentId, selectedWireId, draftWire])
+  }, [selectedComponentId, selectedTextNoteId, deleteSelection])
 
   useEffect(() => {
     if (!isSimulating) {
@@ -791,8 +650,9 @@ function App() {
     return () => window.clearInterval(timer)
   }, [isSimulating])
 
+  /** Stop simulation when there is no circuit (notes-only layout is allowed). */
   useEffect(() => {
-    if (!isLayoutEmpty) {
+    if (!isCircuitEmpty) {
       return
     }
     setIsSimulating(false)
@@ -800,6 +660,12 @@ function App() {
     setCalculationMessage(null)
     setCalculationRibbonDismissed(false)
     setCalculationRibbonExpanded(false)
+  }, [isCircuitEmpty])
+
+  useEffect(() => {
+    if (!isLayoutEmpty) {
+      return
+    }
     setShowExportPanel(false)
   }, [isLayoutEmpty])
 
@@ -809,6 +675,21 @@ function App() {
       setCalculationRibbonExpanded(false)
     }
   }, [calculationMessage])
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('crkt-dsn-properties-drawer', isPropertiesDrawerOpen ? '1' : '0')
+    } catch {
+      /* ignore */
+    }
+  }, [isPropertiesDrawerOpen])
+
+  /** Open properties drawer when user selects a component or text note */
+  useEffect(() => {
+    if (selectedComponentId !== null || selectedTextNoteId !== null) {
+      setIsPropertiesDrawerOpen(true)
+    }
+  }, [selectedComponentId, selectedTextNoteId])
 
   const wirePolylines = wires
     .map((wire) => {
@@ -822,40 +703,17 @@ function App() {
         id: wire.id,
         points: expandOrthogonalPath(controlPoints),
         waypoints: wire.waypoints,
+        currentA: wire.currentA ?? null,
       }
     })
-    .filter((line): line is { id: string; points: Point[]; waypoints: Point[] } => !!line)
-
-  const formatElectric = (value: number | null) => (value === null ? '—' : String(value))
-
-  const getComponentValueText = (component: CircuitComponent) => {
-    if (isSimulating) {
-      if (component.kind === 'led') {
-        return `V:${formatElectric(component.voltage)} I:${formatElectric(component.current)}`
-      }
-      return `V:${formatElectric(component.voltage)} I:${formatElectric(component.current)} R:${formatElectric(component.resistance)}`
-    }
-    if (component.kind === 'battery') {
-      return component.voltage !== null ? `${component.voltage} V` : ''
-    }
-    if (component.kind === 'resistor') {
-      return component.resistance !== null ? `${component.resistance} Ohm` : ''
-    }
-    if (component.kind === 'capacitor') {
-      return `${component.capacitance} uF`
-    }
-    if (component.kind === 'led') {
-      const parts: string[] = []
-      if (component.voltage !== null) {
-        parts.push(`${component.voltage} V`)
-      }
-      if (component.current !== null) {
-        parts.push(`${component.current} A`)
-      }
-      return parts.join(' · ')
-    }
-    return ''
-  }
+    .filter(
+      (line): line is {
+        id: string
+        points: Point[]
+        waypoints: Point[]
+        currentA: number | null
+      } => !!line,
+    )
 
   const simulationPath = useMemo(() => {
     if (!batteryId) {
@@ -957,39 +815,44 @@ function App() {
     return getPathPointAt(simulationPath, simulationProgress)
   }, [isSimulating, simulationPath, simulationProgress])
 
-  const runLayoutExport = async (baseFileName: string, format: 'png' | 'jpeg') => {
+  const runLayoutExport = async (baseFileName: string, format: 'png' | 'jpeg' | 'pdf') => {
     const element = canvasRef.current
+    const scrollEl = layoutPanelScrollRef.current
     if (!element || isExporting) {
       return
     }
     setIsExporting(true)
     try {
+      const diagramBounds = computeDiagramBounds(components, wirePolylines, textNotes)
+      const cropRect =
+        scrollEl && element
+          ? getExportCropRect(scrollEl, element, diagramBounds)
+          : { x: 0, y: 0, width: element.offsetWidth, height: element.offsetHeight }
       const snapshot = await html2canvas(element, {
-        backgroundColor: '#ffffff',
-        scale: 2,
-        logging: false,
-        useCORS: true,
-        /** Skip simulation animation dot (not part of schematic). */
-        ignoreElements: (node) =>
-          node instanceof Element && node.classList.contains('sim-dot'),
-        /** Backup: strip sim-dot from clone (some engines still rasterize ignored SVG nodes). */
-        onclone: (clonedDoc) => {
-          clonedDoc.querySelectorAll('.sim-dot').forEach((el) => el.remove())
-        },
+        ...getLayoutExportHtml2CanvasOptions(),
+        x: cropRect.x,
+        y: cropRect.y,
+        width: cropRect.width,
+        height: cropRect.height,
       })
-      const dataUrl =
-        format === 'png'
-          ? snapshot.toDataURL('image/png')
-          : snapshot.toDataURL('image/jpeg', 0.92)
-      const extension = format === 'png' ? 'png' : 'jpg'
-      const link = document.createElement('a')
-      link.href = dataUrl
-      link.download = `${baseFileName}.${extension}`
-      link.click()
+      if (format === 'pdf') {
+        const { downloadLayoutPdf } = await import('./export/pdfLayout')
+        downloadLayoutPdf(snapshot, baseFileName)
+      } else {
+        const dataUrl =
+          format === 'png'
+            ? snapshot.toDataURL('image/png')
+            : snapshot.toDataURL('image/jpeg', 0.92)
+        const extension = format === 'png' ? 'png' : 'jpg'
+        const link = document.createElement('a')
+        link.href = dataUrl
+        link.download = `${baseFileName}.${extension}`
+        link.click()
+      }
       setShowExportPanel(false)
     } catch (error) {
       console.error(error)
-      window.alert('Could not export the layout as an image. Please try again.')
+      window.alert('Could not export the layout. Please try again.')
     } finally {
       setIsExporting(false)
     }
@@ -999,15 +862,20 @@ function App() {
     event.preventDefault()
     const trimmed = exportFileName.trim()
     const baseName =
-      trimmed === '' ? 'crkt-export' : sanitizeExportBaseName(trimmed)
+      trimmed === '' ? EXPORT_DEFAULT_BASENAME : sanitizeExportBaseName(trimmed)
     const format = exportFormat
     void runLayoutExport(baseName, format)
   }
 
   return (
     <main className="app-shell">
-      <section className="layout-panel">
+      <section
+        className={`layout-panel ${isPropertiesDrawerOpen ? 'layout-panel--drawer-open' : ''}`}
+      >
         <header className="toolbar">
+          <div className="toolbar-brand">
+            <CrktDsnWordmark className="toolbar-brand-logo" />
+          </div>
           {(Object.keys(toolLabels) as Tool[])
             .filter((tool) => tool !== 'none')
             .map((tool) => (
@@ -1018,8 +886,9 @@ function App() {
               title={toolLabels[tool]}
               aria-label={toolLabels[tool]}
               onClick={() => {
-                setActiveTool(tool)
-                if (tool !== 'wire') {
+                const next = activeTool === tool ? ('none' as Tool) : tool
+                setActiveTool(next)
+                if (next !== 'wire') {
                   setDraftWire(null)
                 }
               }}
@@ -1028,18 +897,22 @@ function App() {
             </button>
           ))}
           <button
-            className="tool-button delete-button"
+            className="tool-button toolbar-tool--text delete-button"
             type="button"
-            onClick={deleteSelection}
-            disabled={!selectedComponentId && !selectedWireId}
+            onClick={() => {
+              clearPlacementTool()
+              deleteSelection()
+            }}
+            disabled={!selectedComponentId && !selectedWireId && !selectedTextNoteId}
           >
             Delete
           </button>
           <button
-            className={`tool-button simulate-button ${isSimulating ? 'active' : ''}`}
+            className={`tool-button toolbar-tool--text simulate-button ${isSimulating ? 'active' : ''}`}
             type="button"
-            disabled={isLayoutEmpty}
+            disabled={isCircuitEmpty}
             onClick={() => {
+              clearPlacementTool()
               setIsSimulating((previous) => {
                 if (previous) {
                   setCalculationMessage(null)
@@ -1052,33 +925,63 @@ function App() {
             Simulate
           </button>
           <button
-            className="tool-button calculate-button"
+            className="tool-button toolbar-tool--text"
             type="button"
             disabled={!isSimulating}
             onClick={() => {
-              const { next, message } = runCircuitCalculate(components, wires, kindLabels)
-              setComponents(next)
-              setCalculationMessage(message)
-              setCalculationRibbonDismissed(false)
-              setCalculationRibbonExpanded(false)
+              clearPlacementTool()
+              setComponents((previous) => {
+                const terminalKeys = getAllTerminalKeys(previous)
+                const { next, message, wireCurrentPatch } = runCircuitCalculate(
+                  previous,
+                  wires,
+                  kindLabels,
+                )
+                queueMicrotask(() => {
+                  setCalculationMessage(message)
+                  setCalculationRibbonDismissed(false)
+                  setCalculationRibbonExpanded(false)
+                })
+                setWires((wPrev) => applyWireCurrentPatch(wPrev, wireCurrentPatch, terminalKeys))
+                return applyCalculationByComponentId(previous, next)
+              })
             }}
           >
             Calculate
           </button>
           <button
-            className="tool-button export-button"
+            className="tool-button toolbar-tool--text"
             type="button"
             disabled={isLayoutEmpty}
             title="Export layout as image"
             onClick={() => {
+              clearPlacementTool()
               setShowExportPanel(true)
+              setIsPropertiesDrawerOpen(true)
               setExportFileName('')
               setExportFormat('png')
               setSelectedComponentId(null)
               setSelectedWireId(null)
+              setSelectedTextNoteId(null)
             }}
           >
             Export
+          </button>
+          <button
+            className="tool-button toolbar-tool--text toolbar-clear-button"
+            type="button"
+            disabled={isLayoutEmpty}
+            title={
+              isLayoutEmpty
+                ? 'Nothing on the layout to clear'
+                : 'Remove all components, wires, and notes; reset simulation and id counters'
+            }
+            aria-label="Clear layout"
+            onClick={() => {
+              clearEntireLayout()
+            }}
+          >
+            Clear
           </button>
         </header>
         {calculationMessage && !calculationRibbonDismissed && (
@@ -1087,7 +990,10 @@ function App() {
               <button
                 type="button"
                 className="ribbon-tool-button ribbon-toggle-button"
-                onClick={() => setCalculationRibbonExpanded((expanded) => !expanded)}
+                onClick={() => {
+                  clearPlacementTool()
+                  setCalculationRibbonExpanded((expanded) => !expanded)
+                }}
                 title={calculationRibbonExpanded ? 'Collapse' : 'Expand'}
                 aria-expanded={calculationRibbonExpanded}
                 aria-label={calculationRibbonExpanded ? 'Collapse calculation message' : 'Expand calculation message'}
@@ -1097,7 +1003,10 @@ function App() {
               <button
                 type="button"
                 className="ribbon-tool-button ribbon-close-button"
-                onClick={() => setCalculationRibbonDismissed(true)}
+                onClick={() => {
+                  clearPlacementTool()
+                  setCalculationRibbonDismissed(true)
+                }}
                 title="Close"
                 aria-label="Close calculation message"
               >
@@ -1111,7 +1020,16 @@ function App() {
             </div>
           </div>
         )}
-        <div className="canvas" ref={canvasRef} onClick={handleCanvasClick}>
+        <div className="layout-panel-scroll" ref={layoutPanelScrollRef}>
+          <div
+            className="canvas"
+            ref={canvasRef}
+            onClick={handleCanvasClick}
+            style={{
+              minHeight: CANVAS_MIN_HEIGHT,
+              minWidth: `max(100%, ${CANVAS_MIN_WIDTH}px)`,
+            }}
+          >
           <svg className="wires" aria-hidden="true">
             {wirePolylines.map((line) => (
               <g key={line.id}>
@@ -1122,8 +1040,27 @@ function App() {
                     event.stopPropagation()
                     setSelectedWireId(line.id)
                     setSelectedComponentId(null)
+                    setSelectedTextNoteId(null)
                   }}
                 />
+                {isSimulating &&
+                  line.currentA !== null &&
+                  (() => {
+                    const p = getPathPointAt(line.points, 0.5)
+                    if (!p) {
+                      return null
+                    }
+                    return (
+                      <text
+                        className="wire-current-label"
+                        x={p.x}
+                        y={p.y - 8}
+                        textAnchor="middle"
+                      >
+                        {line.currentA} A
+                      </text>
+                    )
+                  })()}
                 {selectedWireId === line.id &&
                   line.waypoints.map((waypoint, index) => (
                     <circle
@@ -1144,10 +1081,18 @@ function App() {
           {components.map((component) => (
             <div
               key={component.id}
+              id={`layout-component-${component.id}`}
+              data-component-id={component.id}
               role="button"
               tabIndex={0}
-              className={`component-node ${component.orientation} ${selectedComponentId === component.id ? 'selected' : ''}`}
-              style={{ left: component.x, top: component.y }}
+              className={`component-node${selectedComponentId === component.id ? ' selected' : ''}${
+                isComponentPropertiesLocked(component) ? ' component-node--spec-locked' : ''
+              }`}
+              style={{
+                left: component.x,
+                top: component.y,
+              }}
+              aria-label={`${kindLabels[component.kind]} ${component.id}`}
               onMouseDown={(event) => beginDrag(event, component)}
               onClick={(event) => handleComponentClick(event, component)}
               onKeyDown={(event) => {
@@ -1161,55 +1106,169 @@ function App() {
                 }
               }}
             >
-              <ComponentVisual component={component} />
-              <span className={`terminal-dot ${component.orientation === 'vertical' ? 'top' : 'left'}`} />
-              <span
-                className={`terminal-dot ${component.orientation === 'vertical' ? 'bottom' : 'right'}`}
-              />
-              {component.kind === 'battery' && (
-                <>
-                  <span
-                    className={`battery-terminal-label ${
-                      component.orientation === 'vertical' ? 'top' : 'minus'
-                    }`}
-                  >
-                    -
-                  </span>
-                  <span
-                    className={`battery-terminal-label ${
-                      component.orientation === 'vertical' ? 'bottom' : 'plus'
-                    }`}
-                  >
-                    +
-                  </span>
-                </>
-              )}
+              <div className="component-node-body">
+                <div
+                  className="component-node-rotated"
+                  style={{ transform: `rotate(${component.rotationDeg}deg)` }}
+                >
+                  <ComponentVisual component={component} />
+                  {/*
+                    Dots always use left/right in local frame; wrapper rotate(deg) places them on
+                    the real ends. (top/bottom + rotate(90) incorrectly put them on screen left/right.)
+                  */}
+                  <span className="terminal-dot left" />
+                  <span className="terminal-dot right" />
+                  {component.kind === 'battery' && (
+                    <>
+                      <span className="battery-terminal-label minus">-</span>
+                      <span className="battery-terminal-label plus">+</span>
+                    </>
+                  )}
+                </div>
+              </div>
               {selectedComponentId === component.id && (
                 <button
                   type="button"
                   className="rotate-handle"
                   onClick={(event) => {
                     event.stopPropagation()
-                    toggleSelectedOrientation()
+                    rotateSelectedComponent()
                   }}
-                  title="Rotate component"
+                  title="Rotate 90° clockwise"
                 >
                   ↻
                 </button>
               )}
-              <span className="component-value">{getComponentValueText(component)}</span>
+              {isComponentPropertiesLocked(component) && (
+                <span
+                  className="component-lock-badge"
+                  role="img"
+                  aria-label="Electrical properties locked"
+                  title="Electrical properties locked — unlock in the properties panel to edit"
+                >
+                  <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+                    <path
+                      fill="currentColor"
+                      d="M4 7V5a4 4 0 1 1 8 0v2h1v8H3V7h1zm2 0h4V5a2 2 0 1 0-4 0v2z"
+                    />
+                  </svg>
+                </span>
+              )}
+              {calculateTargetComponentId === component.id && (
+                <span
+                  className="component-calculate-target-badge"
+                  role="img"
+                  aria-label="Calculate target: Simulate mode Calculate will update this part’s electric values"
+                  title="This is the only unlocked part — click Calculate (in Simulate mode) to recompute its properties from the locked parts"
+                >
+                  <svg
+                    className="component-calculate-target-badge__svg"
+                    viewBox="0 0 24 24"
+                    width="16"
+                    height="16"
+                    aria-hidden="true"
+                  >
+                    <rect
+                      x="2"
+                      y="2"
+                      width="20"
+                      height="20"
+                      rx="4.5"
+                      ry="4.5"
+                      fill="currentColor"
+                    />
+                    <g
+                      className="component-calculate-target-badge__face"
+                      fill="none"
+                      strokeWidth="1.35"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
+                      <line x1="12" y1="4.75" x2="12" y2="19.25" />
+                      <line x1="4.75" y1="12" x2="19.25" y2="12" />
+                      <line x1="6.25" y1="8" x2="9.75" y2="8" />
+                      <line x1="8" y1="6.25" x2="8" y2="9.75" />
+                      <line x1="14.25" y1="8" x2="17.75" y2="8" />
+                      <line x1="5.9" y1="15.35" x2="10.1" y2="18.65" />
+                      <line x1="10.1" y1="15.35" x2="5.9" y2="18.65" />
+                      <line x1="14.25" y1="15.35" x2="17.75" y2="15.35" />
+                      <line x1="14.25" y1="17.65" x2="17.75" y2="17.65" />
+                    </g>
+                  </svg>
+                </span>
+              )}
+              <span className="component-value">
+                {getComponentValueText(component, isSimulating)}
+              </span>
             </div>
           ))}
+          {textNotes.map((note) => (
+            <LayoutTextNoteCanvas
+              key={note.id}
+              note={note}
+              selected={selectedTextNoteId === note.id}
+              onPatch={patchTextNote}
+              onSelect={handleTextNoteClick}
+              onBeginDrag={beginTextNoteDrag}
+              onTextChange={(id, text) => {
+                setTextNotes((previous) =>
+                  previous.map((n) => (n.id === id ? { ...n, text } : n)),
+                )
+              }}
+            />
+          ))}
+          </div>
         </div>
       </section>
 
-      <aside className="properties-panel">
+      <div
+        className="properties-drawer-root"
+        onPointerDownCapture={clearPlacementTool}
+      >
+        {!isPropertiesDrawerOpen && (
+          <button
+            type="button"
+            className="drawer-tab-button"
+            onClick={() => setIsPropertiesDrawerOpen(true)}
+            aria-label="Open properties panel"
+            title="Open properties panel"
+          >
+            <DrawerOpenChevronIcon />
+          </button>
+        )}
+        <aside
+          className={`properties-panel properties-drawer ${isPropertiesDrawerOpen ? 'properties-drawer--open' : ''}`}
+          aria-hidden={!isPropertiesDrawerOpen}
+        >
+          <div className="properties-drawer-header">
+            <h2 className="properties-drawer-title">
+              {showExportPanel
+                ? 'Export layout'
+                : selectedTextNote
+                  ? 'Text note'
+                  : selectedWire && !selectedComponent
+                    ? 'Wire'
+                    : 'Component Values'}
+            </h2>
+            <button
+              type="button"
+              className="drawer-collapse-button tool-button toolbar-tool"
+              onClick={() => setIsPropertiesDrawerOpen(false)}
+              aria-label="Close properties panel"
+              title="Close panel"
+            >
+              <DrawerCloseChevronIcon />
+            </button>
+          </div>
+          <div className="properties-drawer-body">
         {showExportPanel ? (
           <>
-            <h2>Export layout</h2>
             <p className="hint">
-              Choose a file name and image format, then export. Leave name empty to use{' '}
-              <strong>crkt-export</strong>; format defaults to <strong>PNG</strong>.
+              Choose a file name and format, then export. Leave name empty to use{' '}
+              <strong>{EXPORT_DEFAULT_BASENAME}</strong>; format defaults to <strong>PNG</strong>.{' '}
+              <strong>PDF</strong> embeds the same snapshot as a single A4 page (scaled to fit). If the whole
+              circuit fits in the current view, only that view is exported; if the circuit extends below the
+              view, the export runs from the top of the canvas through the circuit plus a little margin below.
             </p>
             <form className="property-form" onSubmit={handleExportSubmit}>
               <label>
@@ -1217,7 +1276,7 @@ function App() {
                 <input
                   type="text"
                   value={exportFileName}
-                  placeholder="crkt-export"
+                  placeholder={EXPORT_DEFAULT_BASENAME}
                   onChange={(event) => setExportFileName(event.target.value)}
                   autoComplete="off"
                 />
@@ -1227,15 +1286,16 @@ function App() {
                 <select
                   value={exportFormat}
                   onChange={(event) =>
-                    setExportFormat(event.target.value as 'png' | 'jpeg')
+                    setExportFormat(event.target.value as 'png' | 'jpeg' | 'pdf')
                   }
                 >
                   <option value="png">PNG</option>
                   <option value="jpeg">JPEG</option>
+                  <option value="pdf">PDF (A4)</option>
                 </select>
               </label>
               <button className="export-submit-button" type="submit" disabled={isExporting}>
-                {isExporting ? 'Exporting…' : 'Export image'}
+                {isExporting ? 'Exporting…' : 'Export'}
               </button>
               <button
                 className="export-cancel-button"
@@ -1249,155 +1309,352 @@ function App() {
           </>
         ) : (
           <>
-            <h2>Component Values</h2>
             {activeTool === 'wire' && draftWire && (
               <p className="hint">Click canvas for 90 degree bends, then click a component end to finish.</p>
             )}
-            {!selectedComponent && (
-              <p className="hint">Select a component from the layout, or use Export in the toolbar.</p>
+            {activeTool === 'text' && (
+              <p className="hint">
+                Click the canvas to place a pale yellow note. Resize from the corner; drag from the header
+                (or from the edge when the header is hidden).
+              </p>
+            )}
+            {resolvedSelectedTextNote && selectedTextNote && (
+              <form className="property-form">
+                <label>
+                  Note ID
+                  <input
+                    className="property-form-id"
+                    value={selectedTextNote.id}
+                    readOnly
+                    spellCheck={false}
+                  />
+                </label>
+                <label className="property-form-checkbox">
+                  <input
+                    type="checkbox"
+                    checked={resolvedSelectedTextNote.showHeader}
+                    onChange={(event) =>
+                      patchSelectedTextNote({ showHeader: event.target.checked })
+                    }
+                  />
+                  Show header bar
+                </label>
+                {resolvedSelectedTextNote.showHeader ? (
+                  <>
+                    <p className="note-section-label">Header</p>
+                    <label>
+                      Header text
+                      <input
+                        type="text"
+                        value={resolvedSelectedTextNote.headerText}
+                        onChange={(event) =>
+                          patchSelectedTextNote({ headerText: event.target.value })
+                        }
+                        placeholder="T"
+                        autoComplete="off"
+                        style={{
+                          fontSize: `${resolvedSelectedTextNote.headerFontSizePx}px`,
+                          fontWeight: resolvedSelectedTextNote.headerBold ? 700 : 400,
+                          fontStyle: resolvedSelectedTextNote.headerItalic ? 'italic' : 'normal',
+                        }}
+                      />
+                    </label>
+                    <div className="note-font-size-field">
+                      <span className="note-font-size-label">Header size</span>
+                      <div className="note-font-size-controls">
+                        <button
+                          type="button"
+                          className="note-font-step-button"
+                          aria-label="Decrease header font size"
+                          title="Smaller"
+                          onClick={() =>
+                            patchSelectedTextNote({
+                              headerFontSizePx: clampTextFontSize(
+                                (resolvedSelectedTextNote.headerFontSizePx ??
+                                  TEXT_NOTE_HEADER_FONT_DEFAULT_PX) - 1,
+                              ),
+                            })
+                          }
+                        >
+                          −
+                        </button>
+                        <input
+                          type="number"
+                          className="note-font-size-input"
+                          min={TEXT_NOTE_FONT_SIZE_MIN_PX}
+                          max={TEXT_NOTE_FONT_SIZE_MAX_PX}
+                          step={1}
+                          value={resolvedSelectedTextNote.headerFontSizePx}
+                          onChange={(event) => {
+                            const v = parseNumberOrNull(event.target.value)
+                            if (v === null) {
+                              return
+                            }
+                            patchSelectedTextNote({ headerFontSizePx: clampTextFontSize(v) })
+                          }}
+                        />
+                        <button
+                          type="button"
+                          className="note-font-step-button"
+                          aria-label="Increase header font size"
+                          title="Larger"
+                          onClick={() =>
+                            patchSelectedTextNote({
+                              headerFontSizePx: clampTextFontSize(
+                                (resolvedSelectedTextNote.headerFontSizePx ??
+                                  TEXT_NOTE_HEADER_FONT_DEFAULT_PX) + 1,
+                              ),
+                            })
+                          }
+                        >
+                          +
+                        </button>
+                      </div>
+                    </div>
+                    <div className="property-form-checkbox-row">
+                      <label className="property-form-checkbox">
+                        <input
+                          type="checkbox"
+                          checked={resolvedSelectedTextNote.headerBold}
+                          onChange={(event) =>
+                            patchSelectedTextNote({ headerBold: event.target.checked })
+                          }
+                        />
+                        Bold
+                      </label>
+                      <label className="property-form-checkbox">
+                        <input
+                          type="checkbox"
+                          checked={resolvedSelectedTextNote.headerItalic}
+                          onChange={(event) =>
+                            patchSelectedTextNote({ headerItalic: event.target.checked })
+                          }
+                        />
+                        Italic
+                      </label>
+                    </div>
+                  </>
+                ) : null}
+                <label>
+                  Width (px)
+                  <input
+                    type="number"
+                    min={TEXT_NOTE_MIN_WIDTH_PX}
+                    step={1}
+                    value={resolvedSelectedTextNote.width}
+                    onChange={(event) => {
+                      const v = parseNumberOrNull(event.target.value)
+                      if (v === null) {
+                        return
+                      }
+                      patchSelectedTextNote({
+                        width: clampTextNoteSize(v, resolvedSelectedTextNote.height).width,
+                      })
+                    }}
+                  />
+                </label>
+                <label>
+                  Height (px)
+                  <input
+                    type="number"
+                    min={TEXT_NOTE_MIN_HEIGHT_PX}
+                    step={1}
+                    value={resolvedSelectedTextNote.height}
+                    onChange={(event) => {
+                      const v = parseNumberOrNull(event.target.value)
+                      if (v === null) {
+                        return
+                      }
+                      patchSelectedTextNote({
+                        height: clampTextNoteSize(resolvedSelectedTextNote.width, v).height,
+                      })
+                    }}
+                  />
+                </label>
+                <p className="note-section-label">Note body</p>
+                <div className="note-font-size-field">
+                  <span className="note-font-size-label">Body text size</span>
+                  <div className="note-font-size-controls">
+                    <button
+                      type="button"
+                      className="note-font-step-button"
+                      aria-label="Decrease body font size"
+                      title="Smaller"
+                      onClick={() =>
+                        patchSelectedTextNote({
+                          textFontSizePx: clampTextFontSize(
+                            resolvedSelectedTextNote.textFontSizePx - 1,
+                          ),
+                        })
+                      }
+                    >
+                      −
+                    </button>
+                    <input
+                      type="number"
+                      className="note-font-size-input"
+                      min={TEXT_NOTE_FONT_SIZE_MIN_PX}
+                      max={TEXT_NOTE_FONT_SIZE_MAX_PX}
+                      step={1}
+                      value={resolvedSelectedTextNote.textFontSizePx}
+                      onChange={(event) => {
+                        const v = parseNumberOrNull(event.target.value)
+                        if (v === null) {
+                          return
+                        }
+                        patchSelectedTextNote({ textFontSizePx: clampTextFontSize(v) })
+                      }}
+                    />
+                    <button
+                      type="button"
+                      className="note-font-step-button"
+                      aria-label="Increase body font size"
+                      title="Larger"
+                      onClick={() =>
+                        patchSelectedTextNote({
+                          textFontSizePx: clampTextFontSize(
+                            resolvedSelectedTextNote.textFontSizePx + 1,
+                          ),
+                        })
+                      }
+                    >
+                      +
+                    </button>
+                  </div>
+                </div>
+                <div className="property-form-checkbox-row">
+                  <label className="property-form-checkbox">
+                    <input
+                      type="checkbox"
+                      checked={resolvedSelectedTextNote.textBold}
+                      onChange={(event) =>
+                        patchSelectedTextNote({ textBold: event.target.checked })
+                      }
+                    />
+                    Bold
+                  </label>
+                  <label className="property-form-checkbox">
+                    <input
+                      type="checkbox"
+                      checked={resolvedSelectedTextNote.textItalic}
+                      onChange={(event) =>
+                        patchSelectedTextNote({ textItalic: event.target.checked })
+                      }
+                    />
+                    Italic
+                  </label>
+                </div>
+                <label>
+                  Body text
+                  <textarea
+                    value={selectedTextNote.text}
+                    onChange={(event) => updateSelectedTextNote(event.target.value)}
+                    rows={6}
+                    spellCheck
+                    placeholder="Description…"
+                    style={{
+                      fontSize: `${resolvedSelectedTextNote.textFontSizePx}px`,
+                      fontWeight: resolvedSelectedTextNote.textBold ? 700 : 400,
+                      fontStyle: resolvedSelectedTextNote.textItalic ? 'italic' : 'normal',
+                    }}
+                  />
+                </label>
+              </form>
+            )}
+            {selectedWire && !selectedComponent && !selectedTextNote && (
+              <form className="property-form" aria-label={`Wire ${selectedWire.id}`}>
+                <label>
+                  Wire ID
+                  <input className="property-form-id" value={selectedWire.id} readOnly spellCheck={false} />
+                </label>
+                <p className="hint">
+                  {selectedWire.from.componentId}:{selectedWire.from.side} →{' '}
+                  {selectedWire.to.componentId}:{selectedWire.to.side}
+                </p>
+                {isSimulating ? (
+                  selectedWire.currentA != null ? (
+                    <label>
+                      Branch current (A)
+                      <input type="text" readOnly value={String(selectedWire.currentA)} />
+                    </label>
+                  ) : (
+                    <p className="hint">
+                      After <strong>Calculate</strong>, series-loop solves show the same current on every
+                      wire segment (KCL). Other topologies may leave this blank until extended.
+                    </p>
+                  )
+                ) : (
+                  <p className="hint">Turn on <strong>Simulate</strong> to see solved currents on wires.</p>
+                )}
+              </form>
+            )}
+            {!selectedComponent && !selectedTextNote && !selectedWire && (
+              <p className="hint">
+                Select a component, wire, or text note on the layout, choose the <strong>T</strong> tool to
+                add notes, or use Export in the toolbar.
+              </p>
             )}
             {selectedComponent && (
-          <form className="property-form">
+          <form
+            className="property-form"
+            id={`properties-panel-component-${selectedComponent.id}`}
+            aria-label={`Component values for ${selectedComponent.id}`}
+          >
+            <label>
+              Component ID
+              <input
+                className="property-form-id"
+                id={`property-component-id-${selectedComponent.id}`}
+                value={selectedComponent.id}
+                readOnly
+                spellCheck={false}
+                aria-describedby={`property-component-id-hint-${selectedComponent.id}`}
+              />
+            </label>
+            <p
+              id={`property-component-id-hint-${selectedComponent.id}`}
+              className="property-form-id-hint"
+            >
+              Same id as the canvas node (
+              <code>{`layout-component-${selectedComponent.id}`}</code>) and wire endpoints; Calculate
+              updates this part by id; locked parts keep certain specs while analysis still fills V/I/R
+              where appropriate.
+            </p>
+            <label className="property-form-checkbox property-form-lock-row">
+              <input
+                type="checkbox"
+                checked={isComponentPropertiesLocked(selectedComponent)}
+                onChange={toggleSelectedPropertiesLocked}
+                aria-describedby={`property-lock-hint-${selectedComponent.id}`}
+              />
+              Lock electrical properties
+            </label>
+            <p id={`property-lock-hint-${selectedComponent.id}`} className="hint hint--lock">
+              When locked, fields below are read-only. If <strong>any</strong> part is locked but not all,{' '}
+              <strong>Calculate</strong> needs <strong>exactly one</strong> unlocked part so it can be
+              recomputed from the others. If <strong>every</strong> part is locked, Calculate still runs a
+              full readout: wire currents (series loops) and voltages/currents where the solver can fill
+              them without changing your locked specs. With <strong>no</strong> locks, Calculate works on
+              all parts as before. You can still move and rotate the part.
+            </p>
             <label>
               Component
               <input value={kindLabels[selectedComponent.kind]} readOnly />
             </label>
-            {selectedComponent.kind === 'led' && (
-              <label>
-                LED color
-                <select
-                  value={selectedComponent.ledColor}
-                  onChange={(event) => updateSelectedLedColor(event.target.value as LedColor)}
-                >
-                  {LED_COLOR_OPTIONS.map((option) => (
-                    <option key={option.value} value={option.value}>
-                      {option.label}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            )}
-            {isSimulating ? (
-              <>
-                {selectedComponent.kind === 'led' ? (
-                  <p className="hint ohms-hint">
-                    LED: forward voltage and operating current only (no resistance).
-                  </p>
-                ) : (
-                  <p className="hint ohms-hint">
-                    Ohm’s law (V = I × R): enter any two of voltage, current, or resistance, then click
-                    Calculate to fill the third.                     For a matching topology, Calculate uses Kirchhoff’s laws (KVL/KCL) from the
-                    voltage/current divider ideas in DC Ch.6 — e.g. battery + LED + resistor in one
-                    loop; battery with N series resistors (voltage divider); or several resistors in
-                    parallel across the battery. Otherwise Ohm’s law fills a single part’s missing V,
-                    I, or R.
-                  </p>
-                )}
-                <label>
-                  Voltage (V)
-                  <input
-                    type="number"
-                    step="any"
-                    value={selectedComponent.voltage ?? ''}
-                    onChange={(event) => updateSelectedValue('voltage', parseNumberOrNull(event.target.value))}
-                  />
-                </label>
-                <label>
-                  Current (A)
-                  <input
-                    type="number"
-                    step="any"
-                    value={selectedComponent.current ?? ''}
-                    onChange={(event) => updateSelectedValue('current', parseNumberOrNull(event.target.value))}
-                  />
-                </label>
-                {selectedComponent.kind !== 'led' && (
-                  <label>
-                    Resistance (Ohm)
-                    <input
-                      type="number"
-                      step="any"
-                      value={selectedComponent.resistance ?? ''}
-                      onChange={(event) => updateSelectedValue('resistance', parseNumberOrNull(event.target.value))}
-                    />
-                  </label>
-                )}
-                {selectedComponent.kind === 'capacitor' && (
-                  <label>
-                    Capacitance (uF)
-                    <input
-                      type="number"
-                      step="any"
-                      value={selectedComponent.capacitance}
-                      onChange={(event) => updateSelectedValue('capacitance', Number(event.target.value))}
-                    />
-                  </label>
-                )}
-              </>
-            ) : (
-              <>
-                {selectedComponent.kind === 'battery' && (
-                  <label>
-                    Voltage (V)
-                    <input
-                      type="number"
-                      step="any"
-                      value={selectedComponent.voltage ?? ''}
-                      onChange={(event) => updateSelectedValue('voltage', parseNumberOrNull(event.target.value))}
-                    />
-                  </label>
-                )}
-                {selectedComponent.kind === 'resistor' && (
-                  <label>
-                    Resistance (Ohm)
-                    <input
-                      type="number"
-                      step="any"
-                      value={selectedComponent.resistance ?? ''}
-                      onChange={(event) => updateSelectedValue('resistance', parseNumberOrNull(event.target.value))}
-                    />
-                  </label>
-                )}
-                {selectedComponent.kind === 'capacitor' && (
-                  <label>
-                    Capacitance (uF)
-                    <input
-                      type="number"
-                      step="any"
-                      value={selectedComponent.capacitance}
-                      onChange={(event) => updateSelectedValue('capacitance', Number(event.target.value))}
-                    />
-                  </label>
-                )}
-                {selectedComponent.kind === 'led' && (
-                  <label>
-                    Voltage (V)
-                    <input
-                      type="number"
-                      step="any"
-                      value={selectedComponent.voltage ?? ''}
-                      onChange={(event) =>
-                        updateSelectedValue('voltage', parseNumberOrNull(event.target.value))
-                      }
-                    />
-                  </label>
-                )}
-                <label>
-                  Current (A)
-                  <input
-                    type="number"
-                    step="any"
-                    value={selectedComponent.current ?? ''}
-                    onChange={(event) => updateSelectedValue('current', parseNumberOrNull(event.target.value))}
-                  />
-                </label>
-              </>
-            )}
+            <ComponentSpecPropertyFields
+              component={selectedComponent}
+              isSimulating={isSimulating}
+              locked={isComponentPropertiesLocked(selectedComponent)}
+              onNumericChange={updateSelectedValue}
+              onLedColorChange={updateSelectedLedColor}
+            />
           </form>
             )}
           </>
         )}
-      </aside>
+          </div>
+        </aside>
+      </div>
     </main>
   )
 }

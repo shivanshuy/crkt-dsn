@@ -4,7 +4,7 @@
  * KVL: sum of drops = source; KCL: same I everywhere in series.
  */
 
-import type { CircuitComponent, Wire } from './circuitTypes'
+import type { CircuitComponent, Wire } from '../types/circuit'
 import { buildUnionFind, netOf } from './graphUtils'
 import { isSet, roundE } from './electricUtils'
 import type { KirchhoffSeriesResult } from './kirchhoffSeries'
